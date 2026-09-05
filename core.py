@@ -52,6 +52,8 @@ DEFAULT_CONFIG = {
     "engine": "auto",               # 翻译引擎: auto/google/google_chrome/mymemory/baidu
     "baidu_appid": "",
     "baidu_secret": "",
+    "qwen_api_key": "",             # 阿里云百炼 API Key（Qwen 大模型翻译）
+    "qwen_model": "qwen3.7-flash",  # Qwen 模型名，可在设置里换
     "autostart": False,             # 开机自启
     "restore_clipboard": True,      # 划词后恢复原剪贴板
     "auto_speak": False,            # 翻译后自动朗读
@@ -166,21 +168,65 @@ def translate_mymemory(text, cfg=None, to_lang=None):
             "detected": "zh-CN" if to_lang == "en" else "en"}
 
 
+def translate_qwen(text, cfg, to_lang=None):
+    """阿里云百炼 Qwen 大模型翻译（OpenAI 兼容接口，需用户自己的 API Key，
+    也可通过环境变量 DASHSCOPE_API_KEY 提供）"""
+    api_key = (cfg or {}).get("qwen_api_key", "").strip() \
+        or os.getenv("DASHSCOPE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("请先在设置里填写阿里云百炼 API Key（sk-开头）")
+    model = ((cfg or {}).get("qwen_model") or "qwen3.7-flash").strip()
+    if to_lang == "en":
+        sys_prompt = ("你是专业翻译引擎。把用户内容翻译成地道的英文，"
+                      "只输出译文本身，不要任何解释或引号，保留原有换行格式。")
+    else:
+        sys_prompt = ("你是专业翻译引擎。把用户内容翻译成简体中文，"
+                      "只输出译文本身，不要任何解释或引号，保留原有换行格式。")
+    r = requests.post(
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        headers={"Authorization": "Bearer " + api_key, **UA},
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": text[:4000]},
+            ],
+            "stream": False,
+            "enable_thinking": False,  # 翻译无需思考模式，响应更快
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") or (data.get("message") and not data.get("choices")):
+        raise RuntimeError("百炼接口错误: %s" % (data.get("message") or data.get("code")))
+    try:
+        translated = (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("百炼接口返回格式异常: %s" % str(data)[:200])
+    if not translated:
+        raise RuntimeError("Qwen 没有返回译文")
+    return {"translated": translated, "engine": "Qwen(%s)" % model,
+            "detected": "zh-CN" if to_lang == "en" else "en"}
+
+
 ENGINES = {
     "google": translate_google,
     "google_chrome": translate_google_chrome,
     "mymemory": translate_mymemory,
     "baidu": translate_baidu,
+    "qwen": translate_qwen,
 }
 ENGINE_NAMES = {
     "auto": "自动（推荐，依次尝试多个源）",
+    "qwen": "通义千问 Qwen（需API Key，AI翻译）",
     "google": "谷歌翻译",
     "google_chrome": "谷歌翻译（Chrome接口）",
     "mymemory": "MyMemory",
     "baidu": "百度翻译（需密钥）",
 }
-# 自动模式降级链
-AUTO_ORDER = ["google", "google_chrome", "mymemory", "baidu"]
+# 自动模式降级链：配了 Key 优先用 Qwen；没配 Key 时本地校验快速跳过、无网络开销
+AUTO_ORDER = ["qwen", "google", "google_chrome", "mymemory", "baidu"]
 
 
 def translate(text, cfg):

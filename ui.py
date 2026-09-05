@@ -324,6 +324,10 @@ class ResultPopup(QWidget):
         """安排自动关闭；鼠标悬停在窗口上时暂停，移开后重新计时"""
         self._auto_sec = max(0, int(seconds))
         if self._auto_sec > 0:
+            # 结果返回时鼠标可能已停在窗口上（enterEvent 不会再触发，没人停表），
+            # 所以启动前先按坐标查一次：鼠标已就位就不启动，等 leaveEvent 再计时
+            if self.isVisible() and self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+                return
             self._auto_timer.start(self._auto_sec * 1000)
         else:
             self._auto_timer.stop()
@@ -408,8 +412,14 @@ class ResultPopup(QWidget):
         self.move(x, y)
 
     def auto_close(self):
-        if not self._pinned and self.isVisible():
-            self.close()
+        if self._pinned or not self.isVisible():
+            return
+        if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            # 兜底：到点时鼠标仍悬停在窗口上（enterEvent 因故未触发/已过时），
+            # 不关闭，改为重新倒计时，移开后正常关闭
+            self._auto_timer.start(self._auto_sec * 1000)
+            return
+        self.close()
 
     def toggle_pin(self):
         """图钉：钉住后窗口不自动消失（窗口本来就置顶显示）"""
@@ -686,6 +696,22 @@ class MainWindow(QWidget):
         row5.addWidget(self.edt_secret, 1)
         sl.addLayout(row5)
 
+        row_qwen1 = QHBoxLayout()
+        row_qwen1.addWidget(QLabel("百炼API Key："))
+        self.edt_qwen_key = QLineEdit()
+        self.edt_qwen_key.setEchoMode(QLineEdit.Password)
+        self.edt_qwen_key.setPlaceholderText(
+            "阿里云百炼 sk-开头密钥，bailian.console.aliyun.com 免费申请（Qwen AI翻译用）")
+        row_qwen1.addWidget(self.edt_qwen_key, 1)
+        sl.addLayout(row_qwen1)
+
+        row_qwen2 = QHBoxLayout()
+        row_qwen2.addWidget(QLabel("Qwen模型名："))
+        self.edt_qwen_model = QLineEdit()
+        self.edt_qwen_model.setPlaceholderText("默认 qwen3.7-flash，可换成百炼支持的其它模型")
+        row_qwen2.addWidget(self.edt_qwen_model, 1)
+        sl.addLayout(row_qwen2)
+
         self.ck_restore = QCheckBox("划词翻译后恢复原来的剪贴板内容")
         self.ck_autostart = QCheckBox("开机自动启动")
         self.ck_select = QCheckBox("启用划词翻译（关闭后 Alt+Q 无效）")
@@ -736,6 +762,8 @@ class MainWindow(QWidget):
         self.cmb_engine.setCurrentIndex(max(0, idx))
         self.edt_appid.setText(self.cfg.get("baidu_appid", ""))
         self.edt_secret.setText(self.cfg.get("baidu_secret", ""))
+        self.edt_qwen_key.setText(self.cfg.get("qwen_api_key", ""))
+        self.edt_qwen_model.setText(self.cfg.get("qwen_model", "qwen3.7-flash"))
         self.ck_restore.setChecked(self.cfg.get("restore_clipboard", True))
         self.ck_autostart.setChecked(self.cfg.get("autostart", False))
         self.ck_select.setChecked(self.cfg.get("select_enabled", True))
@@ -749,6 +777,8 @@ class MainWindow(QWidget):
         self.cfg["engine"] = self.cmb_engine.currentData()
         self.cfg["baidu_appid"] = self.edt_appid.text().strip()
         self.cfg["baidu_secret"] = self.edt_secret.text().strip()
+        self.cfg["qwen_api_key"] = self.edt_qwen_key.text().strip()
+        self.cfg["qwen_model"] = self.edt_qwen_model.text().strip() or "qwen3.7-flash"
         self.cfg["restore_clipboard"] = self.ck_restore.isChecked()
         self.cfg["select_enabled"] = self.ck_select.isChecked()
         self.cfg["auto_speak"] = self.ck_speak.isChecked()
