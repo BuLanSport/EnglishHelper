@@ -6,8 +6,9 @@ import time
 import threading
 
 import keyboard
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QLockFile
+from PySide6.QtCore import Qt, QObject, Signal, QTimer
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -68,7 +69,7 @@ def _make_tts():
 
 
 class App:
-    def __init__(self, app: QApplication):
+    def __init__(self, app: QApplication, server: QLocalServer):
         self.app = app
         self.cfg = core.load_config()
         self.db = core.DB()
@@ -81,6 +82,8 @@ class App:
         self._hotkeys = []
         self._busy = False  # 防止热键连按重复触发
         self._trans_seq = 0  # 翻译请求序号：慢的旧结果回来时不覆盖新结果
+        self.server = server
+        self.server.newConnection.connect(self._on_instance_wake)
 
         self.bridge.select_requested.connect(self.on_select_hotkey)
         self.bridge.capture_requested.connect(self.on_capture_hotkey)
@@ -101,9 +104,6 @@ class App:
             "选中英文按 %s 翻译；按 %s 框选文字截图翻译。\n点托盘图标打开历史记录和设置。"
             % (self.cfg["hotkey_select"].upper(), self.cfg["hotkey_capture"].upper()),
             QSystemTrayIcon.Information, 6000)
-
-        # 后台预热OCR模型（第一次截图翻译就不用等）
-        threading.Thread(target=core.warmup_ocr, daemon=True).start()
 
     # ---------- 托盘 ----------
     def build_tray_menu(self):
@@ -135,6 +135,19 @@ class App:
         self.mainwin.show()
         self.mainwin.raise_()
         self.mainwin.activateWindow()
+
+    def _on_instance_wake(self):
+        """第二个实例启动时发来唤醒消息，这里把已有实例的主窗口显示出来。"""
+        socket = self.server.nextPendingConnection()
+        if socket is None:
+            return
+        try:
+            if socket.waitForReadyRead(500):
+                data = bytes(socket.readAll()).decode("utf-8", "ignore").strip()
+                if data == "show":
+                    self.open_mainwin()
+        finally:
+            socket.close()
 
     def toggle_select(self, on):
         self.cfg["select_enabled"] = bool(on)
@@ -273,24 +286,25 @@ class App:
 
     def on_captured(self, qimage):
         self.overlay = None
-        arr = ui.qimage_to_rgb_array(qimage)
-        self.balloon("正在识别文字", "已截取图片，正在识别并翻译，请稍候…")
+        try:
+            png = ui.qimage_to_png_bytes(qimage)  # 压缩到1280px再发，控制请求体积
+        except Exception as e:
+            self.balloon("截图失败", str(e))
+            return
+        # 立即弹加载浮窗：Qwen 视觉模型一次完成“识别文字+翻译”
+        self.popup.show_loading("", "截图翻译")
         self._trans_seq += 1
         seq = self._trans_seq
 
         def worker():
             try:
-                text = core.ocr_image(arr)
-                if not text.strip():
-                    self.bridge.task_failed.emit("没有识别到文字。\n提示：框选时尽量贴近文字、框大一点。")
-                    return
-                self.bridge.translating_started.emit(text, "截图")  # OCR完弹"翻译中"浮窗
-                res = core.translate(text, self.cfg)
+                res = core.translate_image_qwen(png, self.cfg)
+                lang = res.get("lang", "en")
                 self.bridge.result_ready.emit({
-                    "text": text, "translated": res["translated"],
+                    "text": res.get("text", ""), "translated": res["translated"],
                     "engine": res["engine"], "is_word": False,
-                    "phonetic": None, "meanings": [], "detected": res.get("detected", "en"),
-                    "way": "截图", "seq": seq, "reverse": res.get("reverse", False),
+                    "phonetic": None, "meanings": [], "detected": lang,
+                    "way": "截图", "seq": seq, "reverse": lang == "zh",
                 })
             except Exception as e:
                 self.bridge.task_failed.emit("截图翻译失败：%s" % e)
@@ -398,14 +412,29 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet("QWidget{font-family:'Microsoft YaHei';font-size:13px;}")
 
-    # 单实例锁（放在程序目录，TempLocation在打包环境下不可靠）
-    lock_path = os.path.join(core.BASE_DIR, "app.lock")
-    lock = QLockFile(lock_path)
-    if not lock.tryLock(200):
+    # 单实例 + 二次启动唤醒
+    instance_name = "EnglishHelperSingleInstance"
+    socket = QLocalSocket()
+    socket.connectToServer(instance_name)
+    if socket.waitForConnected(500):
+        # 已有实例：发消息让它打开窗口，然后自己退出（不弹提示）
+        try:
+            socket.write(b"show\n")
+            socket.waitForBytesWritten(500)
+        finally:
+            socket.disconnectFromServer()
+        sys.exit(0)
+
+    server = QLocalServer()
+    if not server.listen(instance_name):
+        # 可能有上次崩溃残留，尝试清理一次
+        QLocalServer.removeServer(instance_name)
+        server.listen(instance_name)
+    if not server.isListening():
         QMessageBox.information(None, "英译通", "英译通已经在运行了（请看屏幕右下角托盘图标）。")
         return
 
-    a = App(app)
+    a = App(app, server)
     sys.exit(app.exec())
 
 

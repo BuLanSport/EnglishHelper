@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""核心模块：配置、Qwen 翻译、词典查词、OCR、翻译历史数据库、朗读"""
+"""核心模块：配置、Qwen 文本/视觉翻译、词典查词、翻译历史数据库、朗读"""
+import base64
 import json
 import os
 import re
@@ -211,51 +212,84 @@ def lookup_word(word):
         return None, []
 
 
-# ---------------- OCR（RapidOCR，离线识别） ----------------
-_ocr = None
-_ocr_lock = threading.Lock()
+# ---------------- 截图翻译（Qwen 视觉模型：识别+翻译一步完成，无本地 OCR） ----------------
+def translate_image_qwen(png_bytes, cfg):
+    """把截图图片直接发给 Qwen 视觉模型（如 qwen3.7-flash），
+    一次调用同时完成“识别图中文字 + 翻译”，不需要本地 OCR 引擎。
 
-
-def get_ocr():
-    global _ocr
-    with _ocr_lock:
-        if _ocr is None:
-            from rapidocr_onnxruntime import RapidOCR
-            _ocr = RapidOCR()
-        return _ocr
-
-
-def ocr_image(arr):
-    """识别图片(RGB numpy数组)中的文字，按阅读顺序拼接成多行文本"""
-    result, _ = get_ocr()(arr)
-    if not result:
-        return ""
-    items = []
-    for box, text, score in result:
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
-        items.append((min(ys), (min(ys) + max(ys)) / 2, min(xs), str(text), max(ys) - min(ys)))
-    items.sort(key=lambda t: t[1])  # 按中心y排序
-    lines, cur = [], [items[0]]
-    for it in items[1:]:
-        if it[1] - cur[-1][1] <= max(it[4], cur[-1][4]) * 0.6:  # 同一行
-            cur.append(it)
-        else:
-            lines.append(cur)
-            cur = [it]
-    lines.append(cur)
-    out = []
-    for ln in lines:
-        ln.sort(key=lambda t: t[2])  # 行内按x排序
-        out.append(" ".join(t[3] for t in ln))
-    return "\n".join(out)
-
-
-def warmup_ocr():
+    返回 {"text": 识别出的原文, "translated": 译文, "lang": "en"/"zh", "engine": ...}
+    lang 是原文语种：zh 表示原文是中文（即中译英方向），en 反之。
+    """
+    api_key = (cfg or {}).get("qwen_api_key", "").strip() \
+        or os.getenv("DASHSCOPE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("请先在设置里填写阿里云百炼 API Key（sk-开头）")
+    model = ((cfg or {}).get("qwen_model") or "qwen3.7-flash").strip()
+    data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    sys_prompt = ("你是专业翻译引擎，具备图片识别能力。请识别图片中的主体文字内容并翻译：\n"
+                  "1. 图片文字以英文为主 → 翻译成简体中文；以中文为主 → 翻译成英文；"
+                  "中英混合时按占比更多的语言决定方向。\n"
+                  "2. 忽略图片中的窗口标题栏、按钮、边框、水印等界面元素，"
+                  "只识别用户真正想翻译的主体内容。\n"
+                  "3. 原样保留原文与译文的换行结构。\n"
+                  '4. 只输出一个 JSON 对象，不要输出任何其它内容（不要 markdown 代码块）：\n'
+                  '   {"text": "识别出的全部原文", "translated": "翻译结果", "lang": "原文语种，只写en或zh"}\n'
+                  '5. 如果图片里没有任何文字，返回 {"text": "", '
+                  '"translated": "图片中没有识别到文字", "lang": ""}')
     try:
-        get_ocr()
-    except Exception:
-        pass
+        r = _SESSION.post(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            headers={"Authorization": "Bearer " + api_key, **UA},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "识别并翻译这张截图："},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ]},
+                ],
+                "stream": False,
+                "enable_thinking": False,  # 无需思考模式，响应更快
+            },
+            timeout=QWEN_TIMEOUT,
+        )
+        r.raise_for_status()
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError("截图翻译请求失败，请检查网络后重试：%s" % e)
+    data = r.json()
+    if data.get("code") or (data.get("message") and not data.get("choices")):
+        msg = data.get("message") or data.get("code")
+        if re.search(r"image|visual|multimodal|not support|不支持的", str(msg), re.I):
+            msg = ("%s（当前 Qwen 模型不支持图片输入时，请在设置里把模型名换成"
+                   "支持视觉的型号，如 qwen3.7-flash 或 qwen-vl-max）" % msg)
+        raise RuntimeError("百炼接口错误: %s" % msg)
+    try:
+        content = (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("百炼接口返回格式异常: %s" % str(data)[:200])
+    if not content:
+        raise RuntimeError("Qwen 没有返回结果")
+
+    # 解析模型返回的 JSON；万一模型带了多余说明文字，取第一个 { 到最后一个 }
+    text, translated, lang = "", content, ""
+    m = re.search(r"\{.*\}", content, re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                text = str(obj.get("text") or "").strip()
+                translated = str(obj.get("translated") or "").strip()
+                lang = str(obj.get("lang") or "").strip().lower()
+        except Exception:
+            pass
+    if not translated:
+        translated = content
+    return {"text": text, "translated": translated,
+            "lang": "zh" if lang.startswith("zh") else "en",
+            "engine": "Qwen视觉(%s)" % model}
 
 
 # ---------------- 数据库（翻译历史） ----------------

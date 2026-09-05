@@ -2,8 +2,7 @@
 """界面：截图选区遮罩 / 翻译结果弹窗 / 主窗口"""
 import time
 
-import numpy as np
-from PySide6.QtCore import Qt, QRect, QTimer, Signal, QPoint
+from PySide6.QtCore import Qt, QRect, QTimer, Signal, QPoint, QBuffer
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QImage, QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QTableWidget,
@@ -24,6 +23,14 @@ QTableWidget { border: 1px solid #d8dce4; gridline-color: #e8ebf0; selection-bac
 QHeaderView::section { background: #f0f2f6; border: none; border-bottom: 1px solid #d8dce4; padding: 6px; }
 QComboBox { padding: 4px 8px; border: 1px solid #c8ccd4; border-radius: 4px; background: white; }
 """
+
+
+def _format_orig(text):
+    """原文直接完整展示，不再截断；原文区本身在滚动区域内，
+    浮窗高度受 _fit_size 限制为屏幕 70%，超出可滚动查看。"""
+    if not text:
+        return "原文：（未识别到原文）"
+    return "原文：" + text.strip()
 
 
 # ================= 截图选区遮罩 =================
@@ -111,15 +118,18 @@ class Overlay(QWidget):
             self.canceled.emit()
 
 
-def qimage_to_rgb_array(img: QImage) -> np.ndarray:
-    """QImage → RGB numpy 数组（供OCR使用）"""
-    if img.format() != QImage.Format_RGBA8888:
-        img = img.convertToFormat(QImage.Format_RGBA8888)  # 已同格式则省一次全图拷贝
-    w, h = img.width(), img.height()
-    buf = img.constBits()  # PySide6 返回 memoryview
-    arr = np.frombuffer(buf, dtype=np.uint8)
-    arr = arr.reshape((h, img.bytesPerLine() // 4, 4))[:, :w, :3]
-    return np.ascontiguousarray(arr)
+def qimage_to_png_bytes(img: QImage, max_side=1280) -> bytes:
+    """截图 QImage → 等比缩放后编码为 PNG bytes（发给 Qwen 视觉模型用）。
+    限制最长边以控制请求体积（4K 全屏原图有十几 MB，base64 后更大）"""
+    if img.width() > max_side or img.height() > max_side:
+        if img.width() >= img.height():
+            img = img.scaledToWidth(max_side, Qt.SmoothTransformation)
+        else:
+            img = img.scaledToHeight(max_side, Qt.SmoothTransformation)
+    buf = QBuffer()
+    buf.open(QBuffer.WriteOnly)
+    img.save(buf, "PNG")
+    return bytes(buf.data())
 
 
 # ================= 翻译结果弹窗 =================
@@ -264,15 +274,20 @@ class ResultPopup(QWidget):
         self.btn_pin.setStyleSheet("")
         self.btn_copy.setText("复制")
         self.lab_title.setText("%s · 翻译中" % way)
-        if len(text) < 300:
-            self.lab_orig.setText("原文：" + text.replace("\n", " "))
+        if text:
+            self.lab_orig.setText(_format_orig(text))
+            self.lab_orig.setToolTip(text)
             self.lab_orig.show()
         else:
-            self.lab_orig.hide()
+            self.lab_orig.setText("原文：（未识别到原文）")
+            self.lab_orig.setToolTip("")
+            self.lab_orig.show()
         self.lab_phon.hide()
         self.lab_trans.setStyleSheet("color:#9aa3b2;font-size:14px;font-weight:normal;")
         self._load_dots = 0
-        self.lab_trans.setText("正在翻译，请稍候")
+        self._load_msg = ("正在识别并翻译截图，请稍候" if way == "截图"
+                          else "正在翻译，请稍候")
+        self.lab_trans.setText(self._load_msg)
         self.lab_meta.setText("")
         for b in (self.btn_copy, self.btn_speak):
             b.setEnabled(False)
@@ -293,7 +308,7 @@ class ResultPopup(QWidget):
             self._load_timer.stop()
             return
         self._load_dots = (self._load_dots + 1) % 4
-        self.lab_trans.setText("正在翻译，请稍候" + "·" * self._load_dots)
+        self.lab_trans.setText(self._load_msg + "·" * self._load_dots)
 
     def _loading_timeout(self, seq):
         if self._loading and self._load_seq == seq and self.isVisible():
@@ -370,11 +385,9 @@ class ResultPopup(QWidget):
             self.lab_title.setText("翻译结果")
             self.lab_phon.hide()
             self.lab_trans.setText(trans or "（未获取到翻译）")
-            if len(text) < 300:
-                self.lab_orig.setText("原文：" + text.replace("\n", " "))
-                self.lab_orig.show()
-            else:
-                self.lab_orig.hide()
+            self.lab_orig.setText(_format_orig(text))
+            self.lab_orig.setToolTip(text)
+            self.lab_orig.show()
 
         self.lab_meta.setText("来源：%s" % data.get("engine", ""))
 

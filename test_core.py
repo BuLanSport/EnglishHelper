@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""核心功能实测：Qwen 翻译 / 有道词典 / OCR"""
+"""核心功能实测：Qwen 翻译 / 有道词典 / Qwen 视觉截图翻译"""
 import sys
 import os
 
@@ -37,10 +37,11 @@ for w in ["hello", "apple", "transaction"]:
 
 print()
 print("=" * 50)
-print("4) OCR 测试（生成英文图片再识别）")
+print("4) Qwen 视觉截图翻译测试（生成英文图片直接发模型，无本地OCR）")
 print("=" * 50)
 try:
     from PIL import Image, ImageDraw, ImageFont
+    import io
     img = Image.new("RGB", (760, 200), "white")
     d = ImageDraw.Draw(img)
     try:
@@ -50,10 +51,12 @@ try:
         font = font2 = None
     d.text((30, 40), "Machine learning is a field of", font=font, fill="black")
     d.text((30, 110), "artificial intelligence.", font=font2, fill="black")
-    import numpy as np
-    arr = np.array(img)
-    out = core.ocr_image(arr)
-    print("OCR结果 ->", repr(out))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    r = core.translate_image_qwen(buf.getvalue(), cfg)
+    print("识别原文 -> %r" % (r.get("text") or ""))
+    print("译文     -> %s" % (r.get("translated") or "")[:120])
+    print("方向/来源-> lang=%s | %s" % (r.get("lang"), r.get("engine")))
 except Exception as e:
     import traceback
     traceback.print_exc()
