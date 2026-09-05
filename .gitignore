@@ -1,0 +1,19 @@
+# 构建产物（体积大，不入库；需要时用 build.bat 重新生成）
+build/
+dist/
+*.spec
+
+# Python 运行产物
+__pycache__/
+*.pyc
+*.pyo
+
+# 程序运行时生成的文件（属于数据/日志，不属于源代码）
+debug.log
+app.lock
+data.db
+data.db-journal
+
+# 系统垃圾
+Thumbs.db
+Desktop.ini
