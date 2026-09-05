@@ -63,7 +63,8 @@
 【你的数据在哪里（重要）】
 
   翻译历史、生词本、设置都存放在：
-  C:\Users\zlq\AppData\Local\EnglishHelper\
+  %LOCALAPPDATA%\EnglishHelper\
+  （即 C:\Users\你的用户名\AppData\Local\EnglishHelper\）
 
   放在这里的好处：以后更新版本、重装软件、
   甚至删掉整个程序文件夹，你的学习数据都不会丢。
