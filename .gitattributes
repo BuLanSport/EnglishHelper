@@ -1,0 +1,8 @@
+# 换行符规范：跨机器/跨工具不再出现 CRLF/LF 混乱
+* text=auto
+*.py text eol=lf
+*.bat text eol=crlf
+*.txt text eol=crlf
+*.md text eol=crlf
+*.ico binary
+*.db binary
