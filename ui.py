@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""界面：截图选区遮罩 / 翻译结果弹窗 / 复习对话框 / 主窗口"""
+"""界面：截图选区遮罩 / 翻译结果弹窗 / 主窗口"""
 import time
 
 import numpy as np
@@ -7,8 +7,8 @@ from PySide6.QtCore import Qt, QRect, QTimer, Signal, QPoint
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QImage, QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QTableWidget,
-    QTableWidgetItem, QTabWidget, QComboBox, QCheckBox, QHeaderView, QDialog,
-    QAbstractItemView, QApplication, QFrame, QFileDialog, QMessageBox,
+    QTableWidgetItem, QTabWidget, QComboBox, QCheckBox, QHeaderView,
+    QAbstractItemView, QApplication, QFrame, QMessageBox,
     QLineEdit, QScrollArea,
 )
 
@@ -113,7 +113,8 @@ class Overlay(QWidget):
 
 def qimage_to_rgb_array(img: QImage) -> np.ndarray:
     """QImage → RGB numpy 数组（供OCR使用）"""
-    img = img.convertToFormat(QImage.Format_RGBA8888)
+    if img.format() != QImage.Format_RGBA8888:
+        img = img.convertToFormat(QImage.Format_RGBA8888)  # 已同格式则省一次全图拷贝
     w, h = img.width(), img.height()
     buf = img.constBits()  # PySide6 返回 memoryview
     arr = np.frombuffer(buf, dtype=np.uint8)
@@ -123,9 +124,8 @@ def qimage_to_rgb_array(img: QImage) -> np.ndarray:
 
 # ================= 翻译结果弹窗 =================
 class ResultPopup(QWidget):
-    """划词/截图翻译结果浮窗：不抢键盘焦点，可复制/朗读/收藏/固定"""
+    """划词/截图翻译结果浮窗：不抢键盘焦点，可复制/朗读/固定"""
     request_speak = Signal(str, str)
-    request_save = Signal(dict)   # 收藏生词
 
     def __init__(self, on_close_check=None):
         super().__init__(None)
@@ -179,9 +179,8 @@ class ResultPopup(QWidget):
         self.btn_pin.setToolTip("钉住：窗口不会自动消失，可一直留在屏幕上")
         self.btn_copy = QPushButton("复制")
         self.btn_speak = QPushButton("朗读")
-        self.btn_save = QPushButton("收藏生词")
         self.btn_close = QPushButton("关闭")
-        for b in (self.btn_pin, self.btn_copy, self.btn_speak, self.btn_save, self.btn_close):
+        for b in (self.btn_pin, self.btn_copy, self.btn_speak, self.btn_close):
             top.addWidget(b)
         lay.addLayout(top)
 
@@ -225,7 +224,6 @@ class ResultPopup(QWidget):
 
         self.btn_copy.clicked.connect(self.copy_trans)
         self.btn_speak.clicked.connect(self.do_speak)
-        self.btn_save.clicked.connect(self.do_save)
         self.btn_pin.clicked.connect(self.toggle_pin)
         self.btn_close.clicked.connect(self.close)
 
@@ -265,7 +263,6 @@ class ResultPopup(QWidget):
         self.btn_pin.setText("📌")
         self.btn_pin.setStyleSheet("")
         self.btn_copy.setText("复制")
-        self.btn_save.setText("收藏生词")
         self.lab_title.setText("%s · 翻译中" % way)
         if len(text) < 300:
             self.lab_orig.setText("原文：" + text.replace("\n", " "))
@@ -277,7 +274,7 @@ class ResultPopup(QWidget):
         self._load_dots = 0
         self.lab_trans.setText("正在翻译，请稍候")
         self.lab_meta.setText("")
-        for b in (self.btn_copy, self.btn_speak, self.btn_save):
+        for b in (self.btn_copy, self.btn_speak):
             b.setEnabled(False)
         self.scroll.verticalScrollBar().setValue(0)
         self._fit_size()
@@ -311,7 +308,7 @@ class ResultPopup(QWidget):
         self.lab_trans.setText(msg)
         self.lab_meta.setText("")
         self.lab_phon.hide()
-        for b in (self.btn_copy, self.btn_speak, self.btn_save):
+        for b in (self.btn_copy, self.btn_speak):
             b.setEnabled(False)
         self._fit_size()
         if not self.isVisible():
@@ -351,7 +348,7 @@ class ResultPopup(QWidget):
         text = data.get("text", "")
         trans = data.get("translated", "")
         self.lab_trans.setStyleSheet("")
-        for b in (self.btn_copy, self.btn_speak, self.btn_save):
+        for b in (self.btn_copy, self.btn_speak):
             b.setEnabled(True)
         if data.get("reverse"):
             self.lab_title.setText("中译英")
@@ -381,7 +378,7 @@ class ResultPopup(QWidget):
 
         self.lab_meta.setText("来源：%s" % data.get("engine", ""))
 
-    def show_result(self, data):
+    def show_result(self, data, auto_close_sec=None):
         """data: text, translated, engine, is_word, phonetic, meanings"""
         was_loading = self._loading
         self._fill_result(data)
@@ -395,8 +392,10 @@ class ResultPopup(QWidget):
             self.place_near_cursor()
         self.raise_()
         # 自动关闭计时（鼠标悬停时暂停；固定则不关；0=不自动关）
-        self._schedule_auto_close(
-            int(core.load_config().get("show_popup_seconds", 12)))
+        # auto_close_sec 由调用方传入，避免每次翻译结果都重读一次配置文件
+        if auto_close_sec is None:
+            auto_close_sec = int(core.load_config().get("show_popup_seconds", 12))
+        self._schedule_auto_close(auto_close_sec)
 
     def place_near_cursor(self):
         pos = QCursor.pos()
@@ -439,110 +438,6 @@ class ResultPopup(QWidget):
         lang = "en" if self._data.get("detected", "en").startswith("en") else "zh"
         self.request_speak.emit(text, lang)
 
-    def do_save(self):
-        d = dict(self._data)
-        if not d.get("text"):
-            return
-        self.request_save.emit(d)
-        self.btn_save.setText("已收藏")
-        self.btn_save.setEnabled(False)
-        QTimer.singleShot(2500, lambda: (self.btn_save.setText("收藏生词"), self.btn_save.setEnabled(True)))
-
-
-# ================= 复习对话框 =================
-class ReviewDialog(QDialog):
-    """生词复习：看英文回忆中文 → 翻开 → 标记认识/不认识"""
-
-    def __init__(self, rows, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("生词复习")
-        self.resize(460, 300)
-        self.rows = list(rows)
-        import random
-        random.shuffle(self.rows)
-        self.idx = -1
-        self.ok_count = 0
-        self.showing = False
-        self.result_marks = []
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 20, 24, 20)
-        self.lab_progress = QLabel("")
-        self.lab_progress.setStyleSheet("color:#94a3b8;")
-        self.lab_progress.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.lab_progress)
-
-        self.lab_word = QLabel("")
-        self.lab_word.setAlignment(Qt.AlignCenter)
-        self.lab_word.setStyleSheet("font-size:30px;font-weight:bold;color:#1f2937;")
-        self.lab_word.setWordWrap(True)
-        lay.addWidget(self.lab_word, 1)
-
-        self.lab_meaning = QLabel("")
-        self.lab_meaning.setAlignment(Qt.AlignCenter)
-        self.lab_meaning.setStyleSheet("font-size:16px;color:#2563eb;")
-        self.lab_meaning.setWordWrap(True)
-        self.lab_meaning.hide()
-        lay.addWidget(self.lab_meaning, 1)
-
-        btns = QHBoxLayout()
-        self.btn_show = QPushButton("显示中文")
-        self.btn_ok = QPushButton("认识 ✓")
-        self.btn_no = QPushButton("不认识 ✗")
-        self.btn_ok.hide()
-        self.btn_no.hide()
-        self.btn_ok.setStyleSheet("background:#dcfce7;border-color:#86efac;")
-        self.btn_no.setStyleSheet("background:#fee2e2;border-color:#fca5a5;")
-        btns.addWidget(self.btn_show, 1)
-        btns.addWidget(self.btn_ok, 1)
-        btns.addWidget(self.btn_no, 1)
-        lay.addLayout(btns)
-
-        self.btn_show.clicked.connect(self.reveal)
-        self.btn_ok.clicked.connect(lambda: self.mark(True))
-        self.btn_no.clicked.connect(lambda: self.mark(False))
-        self.next_card()
-
-    def next_card(self):
-        self.idx += 1
-        if self.idx >= len(self.rows):
-            return self.finish()
-        row = self.rows[self.idx]
-        self.lab_progress.setText("第 %d / %d 个" % (self.idx + 1, len(self.rows)))
-        self.lab_word.setText(row["word"])
-        self.lab_meaning.hide()
-        self.btn_show.show()
-        self.btn_ok.hide()
-        self.btn_no.hide()
-        self.showing = False
-
-    def reveal(self):
-        row = self.rows[self.idx]
-        self.lab_meaning.setText(row["meaning"] or "（无释义）")
-        self.lab_meaning.show()
-        self.btn_show.hide()
-        self.btn_ok.show()
-        self.btn_no.show()
-        self.showing = True
-
-    def mark(self, known):
-        if not self.showing:
-            return
-        if known:
-            self.ok_count += 1
-        self.result_marks.append((self.rows[self.idx]["id"], known))
-        self.next_card()
-
-    def finish(self):
-        import core as _c
-        db = _c.DB()
-        for wid, known in self.result_marks:
-            if known:
-                db.word_known_mark(wid)
-        QMessageBox.information(self, "复习完成",
-                                "本轮复习 %d 个词，记住了 %d 个，加油！" % (len(self.result_marks), self.ok_count))
-        self.accept()
-
 
 # ================= 主窗口 =================
 class MainWindow(QWidget):
@@ -554,11 +449,10 @@ class MainWindow(QWidget):
         super().__init__()
         self.cfg = cfg
         self.db = db
-        self.setWindowTitle("英译通 EnglishHelper - 英文翻译与学习")
+        self.setWindowTitle("英译通 EnglishHelper - 英文翻译")
         self.resize(760, 560)
         self.setStyleSheet(STYLE)
         self.build_ui()
-        self.refresh_words()
         self.refresh_history()
 
     def build_ui(self):
@@ -578,8 +472,8 @@ class MainWindow(QWidget):
             "<p><b>② 截图翻译：</b>如果文字<b>选不中</b>（在图片里、某些软件里），按 "
             "<b style='color:#1d4ed8'>Alt+W</b>，然后按住鼠标左键，<b>框住那块文字</b>，"
             "松开鼠标就会自动识别并翻译（也是先弹“正在翻译”窗口）。</p>"
-            "<p><b>③ 学习：</b>翻译弹窗上点【收藏生词】保存单词；点【朗读】电脑会读给你听；"
-            "在本窗口的【生词本】页可以复习、导出到Excel。</p>"
+            "<p><b>③ 朗读：</b>翻译弹窗上点【朗读】，电脑会读给你听；"
+            "翻译历史里选中一行点【朗读选中】也可以复习发音。</p>"
             "<p><b>④ 小技巧：</b>划中文会自动<b>翻译成英文</b>——想写英文句子时，"
             "先在任意地方打好中文，选中按 Alt+Q 就得到英文表达。</p>"
             "<h3>遇到问题？</h3>"
@@ -627,32 +521,6 @@ class MainWindow(QWidget):
         self.btn_hist_clear.clicked.connect(self.clear_history)
         self.btn_hist_speak.clicked.connect(self.speak_history_row)
 
-        # ---- 生词本 ----
-        word_w = QWidget()
-        wlay = QVBoxLayout(word_w)
-        bar2 = QHBoxLayout()
-        self.btn_review = QPushButton("开始复习")
-        self.btn_word_del = QPushButton("删除选中")
-        self.btn_export = QPushButton("导出Excel(CSV)")
-        for b in (self.btn_review, self.btn_word_del, self.btn_export):
-            bar2.addWidget(b)
-        bar2.addStretch(1)
-        wlay.addLayout(bar2)
-        self.tbl_word = QTableWidget(0, 3)
-        self.tbl_word.setHorizontalHeaderLabels(["英文", "中文释义", "收藏时间"])
-        self.tbl_word.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tbl_word.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tbl_word.setWordWrap(True)
-        hh2 = self.tbl_word.horizontalHeader()
-        hh2.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh2.setSectionResizeMode(1, QHeaderView.Stretch)
-        self.tbl_word.setColumnWidth(2, 130)
-        wlay.addWidget(self.tbl_word)
-        tabs.addTab(word_w, "生词本")
-        self.btn_word_del.clicked.connect(self.del_word)
-        self.btn_export.clicked.connect(self.export_words)
-        self.btn_review.clicked.connect(self.review_words)
-
         # ---- 设置 ----
         set_w = QWidget()
         sl = QVBoxLayout(set_w)
@@ -674,27 +542,10 @@ class MainWindow(QWidget):
         row2.addStretch(1)
         sl.addLayout(row2)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("翻译引擎："))
-        self.cmb_engine = QComboBox()
-        for k, v in core.ENGINE_NAMES.items():
-            self.cmb_engine.addItem(v, k)
-        row3.addWidget(self.cmb_engine)
-        row3.addStretch(1)
-        sl.addLayout(row3)
-
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("百度翻译appid："))
-        self.edt_appid = QLineEdit()
-        self.edt_appid.setPlaceholderText("用百度翻译时才需要填（fanyi-api.baidu.com 免费申请）")
-        row4.addWidget(self.edt_appid, 1)
-        sl.addLayout(row4)
-        row5 = QHBoxLayout()
-        row5.addWidget(QLabel("百度翻译密钥："))
-        self.edt_secret = QLineEdit()
-        self.edt_secret.setEchoMode(QLineEdit.Password)
-        row5.addWidget(self.edt_secret, 1)
-        sl.addLayout(row5)
+        lab_qwen_tip = QLabel("翻译由通义千问 Qwen 大模型提供（阿里云百炼），"
+                              "需要填写下面的 API Key 才能翻译")
+        lab_qwen_tip.setStyleSheet("color:#2563eb;font-weight:bold;")
+        sl.addWidget(lab_qwen_tip)
 
         row_qwen1 = QHBoxLayout()
         row_qwen1.addWidget(QLabel("百炼API Key："))
@@ -731,18 +582,6 @@ class MainWindow(QWidget):
         row6.addStretch(1)
         sl.addLayout(row6)
 
-        row7 = QHBoxLayout()
-        row7.addWidget(QLabel("桌面快捷方式："))
-        self.btn_shortcut = QPushButton("一键创建到桌面")
-        self.btn_shortcut.setStyleSheet(
-            "background:#f0f6ff;color:#1d4ed8;border:1px solid #b6ccf5;"
-            "padding:6px 14px;border-radius:4px;")
-        self.btn_shortcut.clicked.connect(self.make_desktop_shortcut)
-        row7.addWidget(self.btn_shortcut)
-        row7.addWidget(QLabel("（以后双击桌面图标即可打开英译通）"))
-        row7.addStretch(1)
-        sl.addLayout(row7)
-
         btn_save = QPushButton("保存设置")
         btn_save.setStyleSheet("background:#2563eb;color:white;border:none;padding:8px 20px;")
         btn_save.setFixedWidth(140)
@@ -750,7 +589,7 @@ class MainWindow(QWidget):
         sl.addStretch(1)
         tabs.addTab(set_w, "设置")
         btn_save.clicked.connect(self.save_settings)
-        tabs.currentChanged.connect(lambda _: self.refresh_all())
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         self._fill_settings()
 
@@ -758,10 +597,6 @@ class MainWindow(QWidget):
     def _fill_settings(self):
         self.cmb_hk1.setCurrentText(self.cfg.get("hotkey_select", "alt+q"))
         self.cmb_hk2.setCurrentText(self.cfg.get("hotkey_capture", "alt+w"))
-        idx = self.cmb_engine.findData(self.cfg.get("engine", "auto"))
-        self.cmb_engine.setCurrentIndex(max(0, idx))
-        self.edt_appid.setText(self.cfg.get("baidu_appid", ""))
-        self.edt_secret.setText(self.cfg.get("baidu_secret", ""))
         self.edt_qwen_key.setText(self.cfg.get("qwen_api_key", ""))
         self.edt_qwen_model.setText(self.cfg.get("qwen_model", "qwen3.7-flash"))
         self.ck_restore.setChecked(self.cfg.get("restore_clipboard", True))
@@ -774,9 +609,6 @@ class MainWindow(QWidget):
     def save_settings(self):
         self.cfg["hotkey_select"] = self.cmb_hk1.currentText().strip()
         self.cfg["hotkey_capture"] = self.cmb_hk2.currentText().strip()
-        self.cfg["engine"] = self.cmb_engine.currentData()
-        self.cfg["baidu_appid"] = self.edt_appid.text().strip()
-        self.cfg["baidu_secret"] = self.edt_secret.text().strip()
         self.cfg["qwen_api_key"] = self.edt_qwen_key.text().strip()
         self.cfg["qwen_model"] = self.edt_qwen_model.text().strip() or "qwen3.7-flash"
         self.cfg["restore_clipboard"] = self.ck_restore.isChecked()
@@ -791,40 +623,31 @@ class MainWindow(QWidget):
         QMessageBox.information(self, "已保存", "设置已保存，快捷键立即生效。")
         self.config_changed.emit()
 
-    def make_desktop_shortcut(self):
-        self.btn_shortcut.setEnabled(False)
-        self.btn_shortcut.setText("正在创建…")
-        QApplication.processEvents()
-        ok = core.create_desktop_shortcut()
-        self.btn_shortcut.setEnabled(True)
-        if ok:
-            self.btn_shortcut.setText("✓ 已创建")
-            QMessageBox.information(self, "创建成功",
-                                    "桌面快捷方式已创建。\n以后双击桌面上的【英译通 EnglishHelper】即可打开。")
-        else:
-            self.btn_shortcut.setText("一键创建到桌面")
-            QMessageBox.warning(self, "创建失败",
-                                "自动创建没有成功。\n也可以手动创建：打开程序文件夹，"
-                                "右键 EnglishHelper.exe → 发送到 → 桌面快捷方式。")
-
     # ---- 历史 ----
     def refresh_history(self):
         rows = self.db.history_list()
-        self.tbl_hist.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            self.tbl_hist.setItem(i, 0, QTableWidgetItem(r["source"]))
-            self.tbl_hist.setItem(i, 1, QTableWidgetItem(r["translated"]))
-            self.tbl_hist.setItem(i, 2, QTableWidgetItem(r["way"]))
-            self.tbl_hist.setItem(i, 3, QTableWidgetItem(
-                time.strftime("%m-%d %H:%M", time.localtime(r["created"]))))
-        self.tbl_hist.resizeRowsToContents()
+        tw = self.tbl_hist
+        # 批量填充期间禁止逐项重绘（几百行时能省下大量布局开销）
+        tw.setUpdatesEnabled(False)
+        try:
+            tw.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                tw.setItem(i, 0, QTableWidgetItem(r["source"]))
+                tw.setItem(i, 1, QTableWidgetItem(r["translated"]))
+                tw.setItem(i, 2, QTableWidgetItem(r["way"]))
+                tw.setItem(i, 3, QTableWidgetItem(
+                    time.strftime("%m-%d %H:%M", time.localtime(r["created"]))))
+        finally:
+            tw.setUpdatesEnabled(True)
+        tw.resizeRowsToContents()
 
     def del_history(self):
         rows = self.db.history_list()
-        for it in self.tbl_hist.selectedItems():
-            r = it.row()
-            if r < len(rows):
-                self.db.history_delete(rows[r]["id"])
+        # 选中一行会有 4 个单元格 item，先按行去重再批量删除
+        ids = {rows[it.row()]["id"] for it in self.tbl_hist.selectedItems()
+               if it.row() < len(rows)}
+        if ids:
+            self.db.history_delete_many(list(ids))
         self.refresh_history()
 
     def clear_history(self):
@@ -838,43 +661,13 @@ class MainWindow(QWidget):
         if 0 <= sel < len(rows):
             self.request_speak.emit(rows[sel]["source"], "en")
 
-    # ---- 生词本 ----
-    def refresh_words(self):
-        rows = self.db.word_list()
-        self.tbl_word.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            self.tbl_word.setItem(i, 0, QTableWidgetItem(r["word"]))
-            self.tbl_word.setItem(i, 1, QTableWidgetItem(r["meaning"]))
-            self.tbl_word.setItem(i, 2, QTableWidgetItem(
-                time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created"]))))
-        self.tbl_word.resizeRowsToContents()
-
-    def del_word(self):
-        rows = self.db.word_list()
-        for it in self.tbl_word.selectedItems():
-            r = it.row()
-            if r < len(rows):
-                self.db.word_delete(rows[r]["id"])
-        self.refresh_words()
-
-    def export_words(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出生词本", "我的生词本.csv", "CSV (*.csv)")
-        if path:
-            self.db.export_csv(path)
-            QMessageBox.information(self, "已导出", "生词本已导出到：\n" + path)
-
-    def review_words(self):
-        rows = self.db.word_list()
-        if not rows:
-            QMessageBox.information(self, "生词本是空的", "先在翻译弹窗上点【收藏生词】，再来复习吧。")
-            return
-        dlg = ReviewDialog(rows, self)
-        dlg.exec()
-        self.refresh_words()
-
     def refresh_all(self):
         self.refresh_history()
-        self.refresh_words()
+
+    def _on_tab_changed(self, idx):
+        """切页时只刷新当前页数据（帮助=0 历史=1 设置=2）"""
+        if idx == 1:
+            self.refresh_history()
 
     def closeEvent(self, e):
         e.ignore()   # 点关闭=隐藏到托盘

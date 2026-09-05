@@ -54,6 +54,19 @@ class Bridge(QObject):
     notify = Signal(str, str)  # 标题, 内容
 
 
+def _make_tts():
+    """Qt 内置 TTS（走系统 SAPI），朗读零进程开销、毫秒级响应；
+    环境/打包缺 QtTextToSpeech 或系统无语音时返回 None，调用方退回 PowerShell 通道"""
+    try:
+        from PySide6.QtTextToSpeech import QTextToSpeech
+        tts = QTextToSpeech()
+        if not tts.availableVoices():
+            return None
+        return tts
+    except Exception:
+        return None
+
+
 class App:
     def __init__(self, app: QApplication):
         self.app = app
@@ -63,6 +76,7 @@ class App:
         self.tray = QSystemTrayIcon(make_tray_icon())
         self.popup = ui.ResultPopup()
         self.mainwin = ui.MainWindow(self.cfg, self.db)
+        self._tts = _make_tts()  # Qt TTS（SAPI），朗读不再每次启动 PowerShell
         self.overlay = None
         self._hotkeys = []
         self._busy = False  # 防止热键连按重复触发
@@ -76,7 +90,6 @@ class App:
         self.bridge.notify.connect(self.balloon)
 
         self.popup.request_speak.connect(self.speak)
-        self.popup.request_save.connect(self.save_word)
         self.mainwin.request_speak.connect(self.speak)
         self.mainwin.config_changed.connect(self.rehook_hotkeys)
 
@@ -85,7 +98,7 @@ class App:
         self.tray.show()
         self.tray.showMessage(
             "英译通已启动",
-            "选中英文按 %s 翻译；按 %s 框选文字截图翻译。\n点托盘图标打开生词本和设置。"
+            "选中英文按 %s 翻译；按 %s 框选文字截图翻译。\n点托盘图标打开历史记录和设置。"
             % (self.cfg["hotkey_select"].upper(), self.cfg["hotkey_capture"].upper()),
             QSystemTrayIcon.Information, 6000)
 
@@ -95,7 +108,7 @@ class App:
     # ---------- 托盘 ----------
     def build_tray_menu(self):
         menu = QMenu()
-        act_open = QAction("打开主窗口（生词本/设置）", menu)
+        act_open = QAction("打开主窗口（历史/设置）", menu)
         act_cap = QAction("截图翻译（%s）" % self.cfg["hotkey_capture"].upper(), menu)
         act_select = QAction("划词翻译（先选中文字再按 %s）" % self.cfg["hotkey_select"].upper(), menu)
         self.act_select_toggle = QAction("划词翻译：开", menu, checkable=True)
@@ -229,7 +242,21 @@ class App:
             else:
                 warn_fail()
 
-        QTimer.singleShot(320, after_copy)
+        # 轮询剪贴板：目标程序收到 Ctrl+C 后一般在 30~150ms 内写入，
+        # 相比原来固定等 320ms 明显更快出结果；400ms 仍为空才判定失败/重试
+        state = {"n": 0}
+
+        def poll():
+            state["n"] += 1
+            text = clip.text().strip()
+            if text:
+                after_copy()
+            elif state["n"] >= 16:  # 16 × 25ms ≈ 400ms
+                after_copy()
+            else:
+                QTimer.singleShot(25, poll)
+
+        poll()
 
     # ---------- 截图翻译 ----------
     def on_capture_hotkey(self):
@@ -306,7 +333,7 @@ class App:
             self._log("忽略过期翻译结果(seq=%s < %d): %r"
                       % (seq, self._trans_seq, str(data.get("text"))[:30]))
             return  # 用户又查了新词，慢的旧结果不覆盖
-        self.popup.show_result(data)
+        self.popup.show_result(data, int(self.cfg.get("show_popup_seconds", 12)))
         self.db.history_add(data.get("text", ""), data.get("translated", ""), data.get("way", "划词"))
         if self.cfg.get("auto_speak") and data.get("text"):
             self.speak(data["text"], "en" if data.get("detected", "en").startswith("en") else "zh")
@@ -319,21 +346,21 @@ class App:
 
     # ---------- 学习 ----------
     def speak(self, text, lang):
-        threading.Thread(target=core.speak, args=(text, lang), daemon=True).start()
-
-    def save_word(self, data):
-        text = data.get("text", "").strip()
+        """朗读。优先 Qt TTS（主线程、异步、约 1ms 内返回）；
+        引擎不可用时退回旧通道：后台线程启动 PowerShell SAPI"""
+        text = (text or "").strip()[:220]
         if not text:
             return
-        word = text.split("\n")[0].strip()
-        if data.get("is_word") and data.get("meanings"):
-            meaning = "；".join(data["meanings"][:4])
-        else:
-            meaning = data.get("translated", "")
-        if self.db.word_exists(word):
-            self.balloon("已在生词本", "“%s” 之前已收藏过，本次已更新释义。" % word)
-        self.db.word_add(word, meaning)
-        self.balloon("已收藏生词", "“%s” 已加入生词本，可在主窗口复习。" % word)
+        if self._tts is not None:
+            try:
+                from PySide6.QtCore import QLocale
+                self._tts.setLocale(QLocale("en_US" if lang.startswith("en") else "zh_CN"))
+                self._tts.stop()  # 打断上一次朗读，避免连续点击时语音堆叠
+                self._tts.say(text)
+                return
+            except Exception:
+                pass  # 语音引擎异常时退回 PowerShell 通道
+        threading.Thread(target=core.speak, args=(text, lang), daemon=True).start()
 
     # ---------- 退出 ----------
     def quit(self):

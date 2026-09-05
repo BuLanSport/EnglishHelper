@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""核心功能实测：翻译接口 / 有道词典 / OCR"""
-import io
+"""核心功能实测：Qwen 翻译 / 有道词典 / OCR"""
 import sys
 import os
 
@@ -8,20 +7,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import core
 
 print("=" * 50)
-print("1) 翻译接口测试")
+print("1) 翻译接口测试（Qwen 百炼）")
 print("=" * 50)
 cfg = core.load_config()
 text = "The quick brown fox jumps over the lazy dog."
-for name, fn in core.ENGINES.items():
-    try:
-        r = fn(text, cfg)
-        print("[%s] OK -> %s | 检测语言: %s" % (name, r["translated"][:40], r.get("detected")))
-    except Exception as e:
-        print("[%s] FAIL -> %s" % (name, str(e)[:120]))
+try:
+    r = core.translate_qwen(text, cfg)
+    print("OK -> %s | 检测语言: %s" % (r["translated"][:40], r.get("detected")))
+except Exception as e:
+    print("FAIL -> %s" % str(e)[:120])
 
 print()
 print("=" * 50)
-print("2) 自动降级翻译测试")
+print("2) Qwen 翻译入口测试（自动中英方向）")
 print("=" * 50)
 try:
     r = core.translate(text, cfg)
