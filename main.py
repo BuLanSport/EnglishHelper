@@ -18,7 +18,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def make_tray_icon():
-    """程序图标：蓝底白色“译”字"""
+    """程序图标：优先加载 assets/icon.ico（与 exe 图标统一），失败则代码绘制"""
+    for path in (
+        os.path.join(BASE_DIR, "assets", "icon.ico"),
+        os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "icon.ico"),
+        os.path.join(os.path.dirname(sys.executable), "assets", "icon.ico"),
+    ):
+        try:
+            if path and os.path.exists(path):
+                return QIcon(path)
+        except Exception:
+            pass
+    # 回退：蓝底白色“译”字
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -356,6 +367,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("EnglishHelper")
+    app.setWindowIcon(make_tray_icon())  # 窗口/任务栏图标（否则显示 Qt 默认图）
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet("QWidget{font-family:'Microsoft YaHei';font-size:13px;}")
 
