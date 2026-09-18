@@ -66,6 +66,11 @@ HTTP_TIMEOUT = (4, 10)   # (连接秒, 读取秒)
 QWEN_TIMEOUT = (5, 60)   # 大模型生成较慢，读取时限放宽
 _SESSION = requests.Session()
 
+# 大模型接口公共参数
+QWEN_CHAT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+QWEN_MAX_TOKENS = 8192    # 显式声明输出上限：不设时部分模型默认上限很小，译文会被无声截断
+MAX_INPUT_CHARS = 20000   # 单次翻译的原文长度上限（超出会截断并在译文里明确提示）
+
 
 # ---------------- 配置 ----------------
 def load_config():
@@ -94,6 +99,27 @@ def is_mostly_chinese(text):
     return han / total > 0.3
 
 
+def _qwen_chat(api_key, payload):
+    """POST 百炼 OpenAI 兼容接口，返回 Response。
+
+    请求显式带 max_tokens：不设的话部分模型的默认输出上限很小，
+    译文/识别结果会被无声截断（表现就是"翻译到一半突然没了"）；
+    个别模型不认这个上限值（HTTP 400 且报错提到 max_tokens）时，
+    自动去掉该参数重试一次，保证兼容。"""
+    for attempt in (0, 1):
+        r = _SESSION.post(
+            QWEN_CHAT_URL,
+            headers={"Authorization": "Bearer " + api_key, **UA},
+            json=payload,
+            timeout=QWEN_TIMEOUT,
+        )
+        if (r.status_code == 400 and attempt == 0
+                and payload.get("max_tokens") and "max_tokens" in r.text):
+            payload.pop("max_tokens")
+            continue
+        return r
+
+
 def translate_qwen(text, cfg, to_lang=None):
     """阿里云百炼 Qwen 大模型翻译（OpenAI 兼容接口，需用户自己的 API Key，
     也可通过环境变量 DASHSCOPE_API_KEY 提供）"""
@@ -102,36 +128,43 @@ def translate_qwen(text, cfg, to_lang=None):
     if not api_key:
         raise RuntimeError("请先在设置里填写阿里云百炼 API Key（sk-开头）")
     model = ((cfg or {}).get("qwen_model") or "qwen3.7-flash").strip()
+    src, cap_note = text, ""
+    if len(src) > MAX_INPUT_CHARS:  # 原文超长：截断但明确提示，不再无声截断
+        src = src[:MAX_INPUT_CHARS]
+        cap_note = "\n\n（注意：原文过长，仅翻译了前 %d 字）" % MAX_INPUT_CHARS
     if to_lang == "en":
         sys_prompt = ("你是专业翻译引擎。把用户内容翻译成地道的英文，"
                       "只输出译文本身，不要任何解释或引号，保留原有换行格式。")
     else:
         sys_prompt = ("你是专业翻译引擎。把用户内容翻译成简体中文，"
                       "只输出译文本身，不要任何解释或引号，保留原有换行格式。")
-    r = _SESSION.post(
-        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        headers={"Authorization": "Bearer " + api_key, **UA},
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": text[:4000]},
-            ],
-            "stream": False,
-            "enable_thinking": False,  # 翻译无需思考模式，响应更快
-        },
-        timeout=QWEN_TIMEOUT,
-    )
+    r = _qwen_chat(api_key, {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": src},
+        ],
+        "stream": False,
+        "max_tokens": QWEN_MAX_TOKENS,
+        "enable_thinking": False,  # 翻译无需思考模式，响应更快
+    })
     r.raise_for_status()
     data = r.json()
     if data.get("code") or (data.get("message") and not data.get("choices")):
         raise RuntimeError("百炼接口错误: %s" % (data.get("message") or data.get("code")))
     try:
-        translated = (data["choices"][0]["message"]["content"] or "").strip()
+        choice = data["choices"][0]
+        translated = (choice["message"]["content"] or "").strip()
+        finish = str(choice.get("finish_reason") or "").lower()
     except (KeyError, IndexError, TypeError):
         raise RuntimeError("百炼接口返回格式异常: %s" % str(data)[:200])
     if not translated:
         raise RuntimeError("Qwen 没有返回译文")
+    if finish == "length":
+        # 译文被模型输出上限切断：明确提示，而不是当成完整译文展示
+        translated += "\n\n（注意：内容较长，译文被模型输出上限截断，以上内容不完整）"
+    if cap_note:
+        translated += cap_note
     return {"translated": translated, "engine": "Qwen(%s)" % model,
             "detected": "zh-CN" if to_lang == "en" else "en"}
 
@@ -213,6 +246,64 @@ def lookup_word(word):
 
 
 # ---------------- 截图翻译（Qwen 视觉模型：识别+翻译一步完成，无本地 OCR） ----------------
+def _recover_json_string(tail):
+    """从可能被截断的 JSON 字符串值里抢救内容：收集到闭合引号或串尾为止；
+    若恰好截断在转义序列中间（如 "\\u4e2d\\" 悬空的反斜杠），丢弃残缺转义。"""
+    out, i = [], 0
+    while i < len(tail):
+        c = tail[i]
+        if c == '"':
+            break
+        if c == "\\":
+            if i + 1 >= len(tail):
+                break
+            out.append(tail[i:i + 2])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    try:
+        return json.loads('"' + "".join(out) + '"')
+    except Exception:
+        return "".join(out)
+
+
+def _parse_vision_result(content, finish=""):
+    """解析视觉模型返回内容 → (text, translated, lang)。
+
+    正常情况按完整 JSON 解析（模型偶尔加说明文字，取第一个 { 到最后一个 }）；
+    当输出被 max_tokens 截断导致 JSON 不完整时，完整解析会失败——
+    这时用正则从残片里逐字段抢救已识别的原文和已生成的译文，
+    并在译文末尾附上截断提示，而不是把整段半成品 JSON 当译文展示。"""
+    text, translated, lang = "", "", ""
+    m = re.search(r"\{.*\}", content, re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                text = str(obj.get("text") or "").strip()
+                translated = str(obj.get("translated") or "").strip()
+                lang = str(obj.get("lang") or "").strip().lower()
+        except Exception:
+            pass
+    if not text and not translated:
+        # JSON 没解析出来（多半是被截断）：从残片里逐字段抢救
+        m = re.search(r'"text"\s*:\s*"', content)
+        if m:
+            text = _recover_json_string(content[m.end():]).strip()
+        m = re.search(r'"translated"\s*:\s*"', content)
+        if m:
+            translated = _recover_json_string(content[m.end():]).strip()
+        m = re.search(r'"lang"\s*:\s*"([a-zA-Z\-]*)"', content)
+        if m:
+            lang = m.group(1).strip().lower()
+    if not translated:
+        translated = content  # 模型没按 JSON 格式返回：当作纯译文处理
+    if finish == "length":
+        translated += "\n\n（注意：截图里文字太多，结果被模型输出上限截断，以上内容不完整）"
+    return text, translated, lang
+
+
 def translate_image_qwen(png_bytes, cfg):
     """把截图图片直接发给 Qwen 视觉模型（如 qwen3.7-flash），
     一次调用同时完成“识别图中文字 + 翻译”，不需要本地 OCR 引擎。
@@ -237,23 +328,19 @@ def translate_image_qwen(png_bytes, cfg):
                   '5. 如果图片里没有任何文字，返回 {"text": "", '
                   '"translated": "图片中没有识别到文字", "lang": ""}')
     try:
-        r = _SESSION.post(
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-            headers={"Authorization": "Bearer " + api_key, **UA},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": "识别并翻译这张截图："},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ]},
-                ],
-                "stream": False,
-                "enable_thinking": False,  # 无需思考模式，响应更快
-            },
-            timeout=QWEN_TIMEOUT,
-        )
+        r = _qwen_chat(api_key, {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "识别并翻译这张截图："},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]},
+            ],
+            "stream": False,
+            "max_tokens": QWEN_MAX_TOKENS,
+            "enable_thinking": False,  # 无需思考模式，响应更快
+        })
         r.raise_for_status()
     except RuntimeError:
         raise
@@ -267,26 +354,14 @@ def translate_image_qwen(png_bytes, cfg):
                    "支持视觉的型号，如 qwen3.7-flash 或 qwen-vl-max）" % msg)
         raise RuntimeError("百炼接口错误: %s" % msg)
     try:
-        content = (data["choices"][0]["message"]["content"] or "").strip()
+        choice = data["choices"][0]
+        content = (choice["message"]["content"] or "").strip()
+        finish = str(choice.get("finish_reason") or "").lower()
     except (KeyError, IndexError, TypeError):
         raise RuntimeError("百炼接口返回格式异常: %s" % str(data)[:200])
     if not content:
         raise RuntimeError("Qwen 没有返回结果")
-
-    # 解析模型返回的 JSON；万一模型带了多余说明文字，取第一个 { 到最后一个 }
-    text, translated, lang = "", content, ""
-    m = re.search(r"\{.*\}", content, re.S)
-    if m:
-        try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict):
-                text = str(obj.get("text") or "").strip()
-                translated = str(obj.get("translated") or "").strip()
-                lang = str(obj.get("lang") or "").strip().lower()
-        except Exception:
-            pass
-    if not translated:
-        translated = content
+    text, translated, lang = _parse_vision_result(content, finish)
     return {"text": text, "translated": translated,
             "lang": "zh" if lang.startswith("zh") else "en",
             "engine": "Qwen视觉(%s)" % model}
