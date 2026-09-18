@@ -16,12 +16,13 @@
 ## 环境
 
 - Windows 10 / 11
-- Python 3.13（开发环境用 venv）
+- Python 3.10+（推荐 3.13；开发环境用 venv）
 
 ## 构建
 
 ```bat
-pip install PySide6 keyboard requests pyinstaller
+pip install -r requirements.txt
+pip install pyinstaller
 build.bat
 ```
 
@@ -40,7 +41,7 @@ build.bat
 
 ## 运行
 
-开发运行：`run.bat`（需先安装依赖）。
+开发运行：`run.bat`——若本机没有现成环境，首次运行会自动创建 venv 并安装依赖（约 5~10 分钟），之后每次秒启动。
 日常使用直接双击 `dist\EnglishHelper\EnglishHelper.exe`，托盘常驻。
 
 ## 项目结构
@@ -50,6 +51,7 @@ main.py            主程序：托盘、全局热键、单实例唤醒、划词/
 core.py            核心：Qwen 文本/视觉翻译、词典、数据库、朗读、开机自启
 ui.py              界面：翻译浮窗、截图遮罩、主窗口
 gen_icon.py        图标生成
+requirements.txt   依赖清单（pip install -r requirements.txt）
 installer.iss      安装包制作脚本（Inno Setup；版本号在文件顶部）
 build_installer.bat 一键生成安装包（输出 dist\installer\*.exe）
 test_core.py       Qwen 翻译/词典/视觉截图翻译实测脚本
