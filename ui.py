@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """界面：截图选区遮罩 / 翻译结果弹窗 / 主窗口"""
+import re
 import time
 
 from PySide6.QtCore import Qt, QRect, QTimer, Signal, QPoint, QBuffer
@@ -25,12 +26,36 @@ QComboBox { padding: 4px 8px; border: 1px solid #c8ccd4; border-radius: 4px; bac
 """
 
 
+_ZWSP = "\u200b"                        # 零宽空格：仅显示层用于折行，不改变文本内容
+_LONG_TOKEN_RE = re.compile(r"\S{40,}")  # URL、Windows 路径等超长不可断词
+
+
+def _soft_wrap(text):
+    """给超长不可断词每隔 32 字符插入零宽空格，使其能在词内部折行。
+    QLabel 的 wordWrap 不会在超长词内部断行：它把 sizeHint 宽度撑到整个词的长度、
+    高度只算一行，布局于是给标签一小块高度，文字底部被裁剪（表现为“译文/原文
+    显示到一半突然没了”）。插入断行点后高度计算恢复正常。"""
+    if not text:
+        return text or ""
+
+    def _split(m):
+        s = m.group(0)
+        return _ZWSP.join(s[i:i + 32] for i in range(0, len(s), 32))
+
+    return _LONG_TOKEN_RE.sub(_split, text)
+
+
+def _strip_soft_wrap(text):
+    """复制时还原：去掉显示层插入的零宽空格"""
+    return (text or "").replace(_ZWSP, "")
+
+
 def _format_orig(text):
     """原文直接完整展示，不再截断；原文区本身在滚动区域内，
     浮窗高度受 _fit_size 限制为屏幕 70%，超出可滚动查看。"""
     if not text:
         return "原文：（未识别到原文）"
-    return "原文：" + text.strip()
+    return "原文：" + _soft_wrap(text.strip())
 
 
 # ================= 截图选区遮罩 =================
@@ -245,6 +270,9 @@ class ResultPopup(QWidget):
         self.content.setFixedWidth(inner_w)
         self.content.adjustSize()
         ch = self.content.sizeHint().height()
+        hfw = self.content.heightForWidth(inner_w)  # sizeHint 对折行文本可能低估
+        if hfw > ch:
+            ch = hfw
         top_h = 38  # 标题/按钮行
         want_h = ch + top_h
         max_h = int(g.height() * 0.7)
@@ -320,7 +348,7 @@ class ResultPopup(QWidget):
         self._load_timer.stop()
         self.lab_title.setText("翻译失败")
         self.lab_trans.setStyleSheet("color:#dc2626;font-size:14px;font-weight:normal;")
-        self.lab_trans.setText(msg)
+        self.lab_trans.setText(_soft_wrap(msg))
         self.lab_meta.setText("")
         self.lab_phon.hide()
         for b in (self.btn_copy, self.btn_speak):
@@ -377,14 +405,15 @@ class ResultPopup(QWidget):
             else:
                 self.lab_phon.hide()
             if meanings:
-                self.lab_trans.setText("\n".join("%d. %s" % (i + 1, m) for i, m in enumerate(meanings)))
+                self.lab_trans.setText(_soft_wrap(
+                    "\n".join("%d. %s" % (i + 1, m) for i, m in enumerate(meanings))))
             else:
-                self.lab_trans.setText(trans or "（未查到释义）")
+                self.lab_trans.setText(_soft_wrap(trans or "（未查到释义）"))
             self.lab_orig.hide()
         else:
             self.lab_title.setText("翻译结果")
             self.lab_phon.hide()
-            self.lab_trans.setText(trans or "（未获取到翻译）")
+            self.lab_trans.setText(_soft_wrap(trans or "（未获取到翻译）"))
             self.lab_orig.setText(_format_orig(text))
             self.lab_orig.setToolTip(text)
             self.lab_orig.show()
@@ -444,7 +473,7 @@ class ResultPopup(QWidget):
             self.btn_pin.setStyleSheet("")
 
     def copy_trans(self):
-        QApplication.clipboard().setText(self.lab_trans.text())
+        QApplication.clipboard().setText(_strip_soft_wrap(self.lab_trans.text()))
 
     def do_speak(self):
         text = self._data.get("text", "")
