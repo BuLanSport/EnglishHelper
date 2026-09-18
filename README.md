@@ -27,6 +27,17 @@ build.bat
 
 产出 `dist\EnglishHelper\EnglishHelper.exe`（onedir）。想打成单个 exe 用 `--onefile`。
 
+### 制作安装包（分发给其他用户）
+
+1. 先运行 `build.bat` 生成 `dist\EnglishHelper`
+2. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup`）
+3. 运行 `build_installer.bat`
+
+产出 `dist\installer\EnglishHelper_Setup_<版本号>.exe`（约 38 MB）：中文安装向导、免管理员权限安装、
+自动创建开始菜单/桌面快捷方式、自带卸载程序（卸载时可选是否删除翻译历史与设置）。
+把 Setup.exe 发给别人，双击即可安装。发新版本时只需改 `installer.iss` 顶部的 `MyAppVersion`
+再重新编译。
+
 ## 运行
 
 开发运行：`run.bat`（需先安装依赖）。
@@ -39,6 +50,8 @@ main.py            主程序：托盘、全局热键、单实例唤醒、划词/
 core.py            核心：Qwen 文本/视觉翻译、词典、数据库、朗读、开机自启
 ui.py              界面：翻译浮窗、截图遮罩、主窗口
 gen_icon.py        图标生成
+installer.iss      安装包制作脚本（Inno Setup；版本号在文件顶部）
+build_installer.bat 一键生成安装包（输出 dist\installer\*.exe）
 test_core.py       Qwen 翻译/词典/视觉截图翻译实测脚本
 test_hotkey_e2e.py 划词端到端自动化测试（真实记事本）
 test_popup_ui.py   浮窗 UI 自动化测试（拖动/滚动/图钉/悬停）
