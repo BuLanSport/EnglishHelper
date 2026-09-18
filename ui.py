@@ -60,13 +60,17 @@ def _format_orig(text):
 
 # ================= 截图选区遮罩 =================
 class Overlay(QWidget):
-    """全屏半透明遮罩，鼠标框选区域后发出 selected(QImage)"""
+    """全屏遮罩：显示按下快捷键瞬间“冻结”的屏幕画面，鼠标框选后发出 selected(QImage)。
+
+    冻结画面（而不是松手后实时抓屏）保证框选过程中桌面的任何变化——右键菜单消失、
+    悬停高亮、视频走动——都不影响截图内容；松手后直接从冻结图裁剪，也省掉了延时。"""
     selected = Signal(QImage)
     canceled = Signal()
 
-    def __init__(self, screen):
+    def __init__(self, screen, frozen=None):
         super().__init__(None)
         self._screen = screen
+        self._frozen = frozen  # QPixmap：按下快捷键瞬间抓下的整屏图（物理像素）
         self._origin = None  # QPoint
         self._cur = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -77,21 +81,35 @@ class Overlay(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        if self._frozen is not None and not self._frozen.isNull():
+            # 整屏铺冻结画面并压暗，选区处再画一遍原亮度（等于“突出选区”）
+            p.drawPixmap(self.rect(), self._frozen)
+            p.fillRect(self.rect(), QColor(0, 0, 0, 110))
+            if self._origin and self._cur:
+                sel = QRect(self._origin, self._cur).normalized()
+                p.save()
+                p.setClipRect(sel)
+                p.drawPixmap(self.rect(), self._frozen)
+                p.restore()
+                self._draw_selection_hint(p, sel)
+            return
+        # 兜底（没有冻结图）：半透明遮罩 + 清空选区露出真实屏幕
         p.fillRect(self.rect(), QColor(0, 0, 0, 110))
         if self._origin and self._cur:
             sel = QRect(self._origin, self._cur).normalized()
-            # 选区内透出真实屏幕
             p.setCompositionMode(QPainter.CompositionMode_Clear)
             p.fillRect(sel, Qt.transparent)
             p.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            pen = QPen(QColor("#22c55e"), 2)
-            p.setPen(pen)
-            p.drawRect(sel)
-            # 尺寸提示
-            p.setPen(QPen(QColor("#22c55e")))
-            p.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-            p.drawText(sel.x(), max(18, sel.y() - 6),
-                       "%d × %d  松开鼠标完成截图，右键/Esc取消" % (sel.width(), sel.height()))
+            self._draw_selection_hint(p, sel)
+
+    def _draw_selection_hint(self, p, sel):
+        """选区绿框 + 尺寸提示"""
+        p.setPen(QPen(QColor("#22c55e"), 2))
+        p.drawRect(sel)
+        p.setPen(QPen(QColor("#22c55e")))
+        p.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+        p.drawText(sel.x(), max(18, sel.y() - 6),
+                   "%d × %d  松开鼠标完成截图，右键/Esc取消" % (sel.width(), sel.height()))
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -114,10 +132,8 @@ class Overlay(QWidget):
         if sel.width() < 8 or sel.height() < 8:  # 太小视为取消
             self._finish_cancel()
             return
-        # 先隐藏窗口（避免遮罩被截进图里），稍等桌面重绘后再抓屏
-        self.hide()
-        QApplication.processEvents()
-        QTimer.singleShot(150, lambda: self._capture(sel))
+        # 直接从冻结图裁剪：不依赖抓屏时机，桌面此刻怎么变都不影响结果
+        self._crop_and_emit(sel)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
@@ -127,10 +143,12 @@ class Overlay(QWidget):
         self.close()
         self.canceled.emit()
 
-    def _capture(self, sel_logical):
-        """抓取屏幕物理像素并按选区裁剪"""
+    def _crop_and_emit(self, sel_logical):
+        """从冻结图按选区裁剪（物理像素）并发出 selected"""
         try:
-            pm = self._screen.grabWindow(0)  # 物理分辨率整屏图
+            pm = self._frozen
+            if pm is None or pm.isNull():
+                pm = self._screen.grabWindow(0)  # 兜底：没有冻结图时退回现场抓屏
             dpr = pm.devicePixelRatio() or 1.0
             rect = QRect(int(sel_logical.x() * dpr), int(sel_logical.y() * dpr),
                          int(sel_logical.width() * dpr), int(sel_logical.height() * dpr))

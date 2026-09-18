@@ -278,7 +278,10 @@ class App:
         from PySide6.QtGui import QCursor, QGuiApplication
         pos = QCursor.pos()
         screen = QGuiApplication.screenAt(pos) or self.app.primaryScreen()
-        self.overlay = ui.Overlay(screen)
+        # 先抓屏“冻结”画面（此刻遮罩还没显示，截到的就是当前屏幕）：
+        # 之后框选期间桌面怎么变——右键菜单消失、悬停高亮、视频走动——都不影响截图内容
+        frozen = screen.grabWindow(0)
+        self.overlay = ui.Overlay(screen, frozen)
         self.overlay.selected.connect(self.on_captured)
         self.overlay.canceled.connect(lambda: setattr(self, "overlay", None))
         self.overlay.setGeometry(screen.geometry())
