@@ -69,14 +69,13 @@ def main():
 
     captured = {}
 
-    def spy(text, way):
+    def spy(text, way, direction="auto", *_):
         # 只验证提取+加载窗链路，不真正联网：
         # 模拟真实 translate_async 行为：先弹加载窗，300ms 后出结果
         captured["text"] = text
-        a.bridge.translating_started.emit(text, way)
+        a.bridge.translating_started.emit(text, way, direction)
         QTimer.singleShot(300, lambda: a.bridge.result_ready.emit({
             "text": text, "translated": "今天天气很好", "engine": "测试引擎",
-            "is_word": False, "phonetic": None, "meanings": [],
             "detected": "en", "way": way,
         }))
 

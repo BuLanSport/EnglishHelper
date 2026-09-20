@@ -49,7 +49,7 @@ class Bridge(QObject):
     """全局热键回调（键盘钩子线程）→ Qt 主线程 的信号桥"""
     select_requested = Signal()
     capture_requested = Signal()
-    translating_started = Signal(str, str)  # (text, way)：立即弹"翻译中"浮窗
+    translating_started = Signal(str, str, str)  # (text, way, direction)：立即弹"翻译中"浮窗
     result_ready = Signal(dict)
     task_failed = Signal(str)
     notify = Signal(str, str)  # 标题, 内容
@@ -93,6 +93,7 @@ class App:
         self.bridge.notify.connect(self.balloon)
 
         self.popup.request_speak.connect(self.speak)
+        self.popup.request_retranslate.connect(self.on_retranslate)
         self.mainwin.request_speak.connect(self.speak)
         self.mainwin.config_changed.connect(self.rehook_hotkeys)
 
@@ -295,7 +296,7 @@ class App:
             self.balloon("截图失败", str(e))
             return
         # 立即弹加载浮窗：Qwen 视觉模型一次完成“识别文字+翻译”
-        self.popup.show_loading("", "截图翻译")
+        self.popup.show_loading("", "截图")
         self._trans_seq += 1
         seq = self._trans_seq
 
@@ -305,8 +306,7 @@ class App:
                 lang = res.get("lang", "en")
                 self.bridge.result_ready.emit({
                     "text": res.get("text", ""), "translated": res["translated"],
-                    "engine": res["engine"], "is_word": False,
-                    "phonetic": None, "meanings": [], "detected": lang,
+                    "engine": res["engine"], "detected": lang,
                     "way": "截图", "seq": seq, "reverse": lang == "zh",
                 })
             except Exception as e:
@@ -315,27 +315,27 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 翻译 ----------
-    def on_translating(self, text, way):
+    def on_translating(self, text, way, direction="auto"):
         """取到文字开始翻译时立即弹"翻译中"浮窗，让用户知道程序在工作"""
-        self.popup.show_loading(text, way)
+        self.popup.show_loading(text, way, direction)
 
-    def translate_async(self, text, way):
+    def on_retranslate(self, text, way, direction):
+        """用户在浮窗里手动指定翻译方向 → 用同一段原文按新方向重译"""
+        self.translate_async(text, way, direction)
+
+    def translate_async(self, text, way, direction="auto"):
+        """direction: auto=自动判定方向，en=强制中译英，zh=强制英译中"""
         self._trans_seq += 1
         seq = self._trans_seq
 
         def worker():
             try:
-                self.bridge.translating_started.emit(text, way)  # 先弹加载窗
-                reverse = core.is_mostly_chinese(text)
-                is_word = core.is_single_word(text) and not reverse  # 中文不走英汉词典
-                phonetic, meanings = (None, [])
-                if is_word:
-                    phonetic, meanings = core.lookup_word(text)
-                res = core.translate(text, self.cfg)
+                # 先弹加载窗，并带上本次方向（浮窗据此同步按钮选中态）
+                self.bridge.translating_started.emit(text, way, direction)
+                res = core.translate(text, self.cfg, direction)
                 self.bridge.result_ready.emit({
                     "text": text, "translated": res["translated"],
-                    "engine": res["engine"], "is_word": is_word,
-                    "phonetic": phonetic, "meanings": meanings,
+                    "engine": res["engine"],
                     "detected": res.get("detected", "en"), "way": way,
                     "seq": seq, "reverse": res.get("reverse", False),
                 })
@@ -430,8 +430,17 @@ def main():
 
     server = QLocalServer()
     if not server.listen(instance_name):
-        # 可能有上次崩溃残留，尝试清理一次
-        QLocalServer.removeServer(instance_name)
+        # listen 失败有两种可能：已有实例占着（应直接退出），或上次异常退出留下的管道残留
+        # （可清理后重试）。必须先探测来区分——能连上就是活实例；
+        # 此时若贸然 removeServer()，会把对方正在用的管道删掉，
+        # 于是两个实例同时存活、同一个热键被响应两次（弹两个窗）。
+        probe = QLocalSocket()
+        probe.connectToServer(instance_name)
+        if probe.waitForConnected(300):
+            probe.disconnectFromServer()
+            QMessageBox.information(None, "英译通", "英译通已经在运行了（请看屏幕右下角托盘图标）。")
+            return
+        QLocalServer.removeServer(instance_name)   # 确属残留：清理后重试
         server.listen(instance_name)
     if not server.isListening():
         QMessageBox.information(None, "英译通", "英译通已经在运行了（请看屏幕右下角托盘图标）。")

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""核心模块：配置、Qwen 文本/视觉翻译、词典查词、翻译历史数据库、朗读"""
+"""核心模块：配置、Qwen 文本/视觉翻译、翻译历史数据库、朗读"""
 import base64
 import json
 import os
@@ -60,10 +60,8 @@ DEFAULT_CONFIG = {
 APP_NAME = "英译通 EnglishHelper"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
-# HTTP：模块级共享 Session 复用连接（keep-alive），连续翻译不再重复 TCP/TLS 握手；
-# 连接阶段超时设短：某个翻译源不可达时快速失败，尽快降级到下一个引擎
-HTTP_TIMEOUT = (4, 10)   # (连接秒, 读取秒)
-QWEN_TIMEOUT = (5, 60)   # 大模型生成较慢，读取时限放宽
+# HTTP：模块级共享 Session 复用连接（keep-alive），连续翻译不再重复 TCP/TLS 握手
+QWEN_TIMEOUT = (5, 60)   # (连接秒, 读取秒)：大模型生成较慢，读取时限放宽
 _SESSION = requests.Session()
 
 # 大模型接口公共参数
@@ -169,10 +167,17 @@ def translate_qwen(text, cfg, to_lang=None):
             "detected": "zh-CN" if to_lang == "en" else "en"}
 
 
-def translate(text, cfg):
+def translate(text, cfg, direction="auto"):
     """Qwen 大模型翻译（阿里云百炼，需在设置里填 API Key）。
-    智能方向：划中的是中文时自动改为中译英（方便写英文）"""
-    reverse = is_mostly_chinese(text)
+
+    direction：auto=按原文语言自动判定方向（划中文自动中译英，方便写英文）；
+    en=强制中译英；zh=强制英译中——自动判定失误时由用户在浮窗手动指定。"""
+    if direction == "en":
+        reverse = True
+    elif direction == "zh":
+        reverse = False
+    else:
+        reverse = is_mostly_chinese(text)
     to_lang = "en" if reverse else "zh-CN"
     try:
         res = translate_qwen(text, cfg, to_lang=to_lang)
@@ -182,67 +187,6 @@ def translate(text, cfg):
         raise  # 未配Key/百炼接口错误等：保留原始中文提示
     except Exception as e:
         raise RuntimeError("翻译失败，请检查网络后重试：%s" % e)
-
-
-# ---------------- 有道词典查词（音标+释义） ----------------
-_WORD_RE = re.compile(r"^[A-Za-z][A-Za-z' \-\.]{0,40}$")
-
-
-def is_single_word(text):
-    """判断是否单词查询模式"""
-    t = text.strip()
-    if not t or "\n" in t:
-        return False
-    return bool(_WORD_RE.match(t)) and len(t.split()) <= 3
-
-
-def _extract_strings(obj, out):
-    """递归提取嵌套结构里的字符串（有道jsonapi结构多变）"""
-    if isinstance(obj, str):
-        s = obj.strip()
-        if s and not s.startswith("http") and len(s) < 500:
-            out.append(s)
-    elif isinstance(obj, list):
-        for x in obj:
-            _extract_strings(x, out)
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in ("return-phrase", "word", "phone", "ukphone", "usphone"):
-                continue
-            _extract_strings(v, out)
-    return out
-
-
-def lookup_word(word):
-    """有道词典查询，返回 (音标, 释义列表)；失败返回 (None, [])"""
-    word = word.strip()
-    try:
-        r = _SESSION.get(
-            "https://dict.youdao.com/jsonapi",
-            params={"q": word, "dicts": json.dumps({"count": 1, "dicts": [["ec"]]}, separators=(",", ":"))},
-            headers=UA,
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json().get("ec", {}).get("word", [])
-        if not data:
-            return None, []
-        item = data[0]
-        phonetic = item.get("usphone") or item.get("ukphone") or None
-        raw = []
-        for tr in item.get("trs", []):
-            _extract_strings(tr.get("tr", {}), raw)
-        # 去重、去掉词条本身
-        meanings = []
-        for s in raw:
-            if s != word and s not in meanings and not s.isascii() or (s != word and re.search(r"[\u4e00-\u9fff]", s)):
-                if s not in meanings:
-                    meanings.append(s)
-        # 只保留含中文的释义，最多8条
-        meanings = [m for m in meanings if re.search(r"[\u4e00-\u9fff]", m)][:8]
-        return phonetic, meanings
-    except Exception:
-        return None, []
 
 
 # ---------------- 截图翻译（Qwen 视觉模型：识别+翻译一步完成，无本地 OCR） ----------------

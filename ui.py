@@ -3,13 +3,13 @@
 import re
 import time
 
-from PySide6.QtCore import Qt, QRect, QTimer, Signal, QPoint, QBuffer
+from PySide6.QtCore import Qt, QRect, QTimer, Signal, QPoint, QBuffer, QEvent
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QImage, QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QTabWidget, QComboBox, QCheckBox, QHeaderView,
     QAbstractItemView, QApplication, QFrame, QMessageBox,
-    QLineEdit, QScrollArea,
+    QLineEdit, QScrollArea, QButtonGroup,
 )
 
 import core
@@ -177,8 +177,11 @@ def qimage_to_png_bytes(img: QImage, max_side=1280) -> bytes:
 
 # ================= 翻译结果弹窗 =================
 class ResultPopup(QWidget):
-    """划词/截图翻译结果浮窗：不抢键盘焦点，可复制/朗读/固定"""
+    """划词/截图翻译结果浮窗：不抢键盘焦点，可复制/朗读/固定/改翻译方向/手动调整大小"""
     request_speak = Signal(str, str)
+    request_retranslate = Signal(str, str, str)  # (text, way, direction)：用户手动指定方向后重译
+    MIN_W, MIN_H = 420, 110   # 用户手动调整窗口时的最小尺寸
+    RESIZE_MARGIN = 6         # 窗口边缘的“拖拽调整大小”热区宽度
 
     def __init__(self, on_close_check=None):
         super().__init__(None)
@@ -187,6 +190,9 @@ class ResultPopup(QWidget):
         self._pinned = False
         self._data = {}
         self._loading = False
+        self._auto_sizing = False  # _fit_size 自动调整中：用于区分用户手动改变窗口大小
+        self._last_screen = None   # 上次所在屏幕：用于检测跨屏拖动
+        self.setMouseTracking(True)  # 鼠标移到边缘时给出“可调整大小”的光标提示
         self._load_dots = 0
         self._load_seq = 0  # 加载代次：防止上一轮的30秒超时定时器误报本轮
         self._auto_sec = 12
@@ -207,6 +213,11 @@ class ResultPopup(QWidget):
             QPushButton { border: none; background: transparent; color: #5b6472;
                           padding: 4px 8px; border-radius: 4px; font-size: 12px; }
             QPushButton:hover { background: #eef2f8; color: #1d4ed8; }
+            QPushButton#dirbtn { border: 1px solid #d5dae2; border-radius: 4px;
+                                 padding: 2px 10px; font-size: 11px; background: #ffffff; }
+            QPushButton#dirbtn:hover { background: #eef2f8; border-color: #9aa4b2; }
+            QPushButton#dirbtn:checked { background: #2563eb; border-color: #2563eb;
+                                         color: #ffffff; font-weight: bold; }
             QScrollArea { border: none; background: transparent; }
             QScrollArea > QWidget > QWidget { background: transparent; }
             QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
@@ -217,12 +228,13 @@ class ResultPopup(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)
         panel = QFrame(objectName="popup")
-        lay = QVBoxLayout(panel)
+        self.lay = lay = QVBoxLayout(panel)  # 保存引用：_fit_size 需要读它的边距/间距
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(6)
 
         # 顶部：标题（兼作拖动手柄） + 按钮
         top = QHBoxLayout()
+        self.top_layout = top  # 保存引用：_fit_size 用它实测标题行高度
         self.lab_title = QLabel("翻译结果")
         self.lab_title.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:bold;")
         self.lab_title.setCursor(Qt.SizeAllCursor)  # 提示此处可拖动
@@ -245,7 +257,7 @@ class ResultPopup(QWidget):
         self.content = QWidget()
         cl = QVBoxLayout(self.content)
         cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(6)
+        cl.setSpacing(8)
 
         # 原文
         self.lab_orig = QLabel(objectName="orig")
@@ -254,11 +266,6 @@ class ResultPopup(QWidget):
         self.lab_orig.hide()
         cl.addWidget(self.lab_orig)
 
-        # 音标
-        self.lab_phon = QLabel(objectName="meta")
-        self.lab_phon.hide()
-        cl.addWidget(self.lab_phon)
-
         # 译文
         self.lab_trans = QLabel(objectName="trans")
         self.lab_trans.setWordWrap(True)
@@ -266,9 +273,29 @@ class ResultPopup(QWidget):
         self.lab_trans.setOpenExternalLinks(False)
         cl.addWidget(self.lab_trans)
 
-        # 底部信息
+        # 底部：翻译方向（默认自动；自动判定失误时点一下立即按新方向重译）
+        bottom = QHBoxLayout()
+        bottom.setSpacing(4)
+        self._dir_keys = ["auto", "en", "zh"]  # 按钮序号 → 方向（en=中译英，zh=英译中）
+        self._dir_buttons = {}
+        self.dir_group = QButtonGroup(self)
+        self.dir_group.setExclusive(True)
+        dir_tips = {"auto": "自动识别中英文并选择翻译方向（默认）",
+                    "en": "把中文翻译成英文", "zh": "把英文翻译成中文"}
+        for i, (label, key) in enumerate(zip(("自动", "中译英", "英译中"), self._dir_keys)):
+            b = QPushButton(label, objectName="dirbtn")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(dir_tips[key] + "；切换后立即按新方向重新翻译")
+            self.dir_group.addButton(b, i)
+            self._dir_buttons[key] = b
+            bottom.addWidget(b)
+        self.dir_group.idClicked.connect(self._on_dir_clicked)
+        self._set_dir("auto")
+        bottom.addStretch(1)
         self.lab_meta = QLabel(objectName="meta")
-        cl.addWidget(self.lab_meta)
+        bottom.addWidget(self.lab_meta)
+        cl.addLayout(bottom)
         cl.addStretch(1)
 
         self.scroll.setWidget(self.content)
@@ -279,26 +306,154 @@ class ResultPopup(QWidget):
         self.btn_speak.clicked.connect(self.do_speak)
         self.btn_pin.clicked.connect(self.toggle_pin)
         self.btn_close.clicked.connect(self.close)
+        self._install_hover_tracking()
 
-    # ---- 尺寸：宽度上限522，高度最多屏高70%，超出靠滚动 ----
-    def _fit_size(self):
-        g = (QGuiApplication.screenAt(QCursor.pos())
-             or QGuiApplication.primaryScreen()).availableGeometry()
-        inner_w = 480  # 522 - root边距2 - panel左右边距28 - 竖滚动条约12
-        self.content.setFixedWidth(inner_w)
+    # ---- 尺寸：宽度随内容自适应（上限522），高度实测，最多屏高70%，超出靠滚动 ----
+    def _screen(self):
+        """当前以哪块屏幕为基准：窗口所在屏幕优先（多显示器拖动后才对得上），
+        窗口还没显示时退回光标所在屏幕，最后兜底主屏。"""
+        if self.isVisible():
+            s = QGuiApplication.screenAt(self.frameGeometry().center())
+            if s is not None:
+                return s
+        return (QGuiApplication.screenAt(QCursor.pos())
+                or QGuiApplication.primaryScreen())
+
+    def _chrome(self):
+        """非滚动部分（标题行 + 边距 + 间距）的高度：窗口高 = chrome + 滚动区高。
+
+        标题行由顶部布局实测（按钮文字变了也能跟上），边距/间距直接取布局的实际设置值。"""
+        self.top_layout.invalidate()
+        m_root = self.layout().contentsMargins()
+        m_panel = self.lay.contentsMargins()
+        return (m_root.top() + m_root.bottom() + m_panel.top() + m_panel.bottom()
+                + self.lay.spacing() + self.top_layout.sizeHint().height())
+
+    def _measure_content(self, width):
+        """按给定内容宽度试算所需高度（折行文本按 heightForWidth 精确算）"""
+        self.content.setFixedWidth(width)
         self.content.adjustSize()
-        ch = self.content.sizeHint().height()
-        hfw = self.content.heightForWidth(inner_w)  # sizeHint 对折行文本可能低估
-        if hfw > ch:
-            ch = hfw
-        top_h = 38  # 标题/按钮行
-        want_h = ch + top_h
-        max_h = int(g.height() * 0.7)
-        self.resize(522, max(90, min(want_h, max_h)))
+        return max(self.content.sizeHint().height(),
+                   self.content.heightForWidth(width))
 
-    # ---- 无边框窗口拖动 ----
+    def _fit_size(self):
+        """弹窗尺寸自适应。
+
+        高度 = “非滚动部分（标题行 + 边距 + 间距）+ 滚动区高度”，超过屏幕 70% 时
+        只压滚动区——标题行和底部方向按钮永远完整可见，超出内容交给滚动条。
+
+        注意：不能读窗口的 sizeHint / minimumSizeHint 来定高。QScrollArea 会缓存
+        内容的 sizeHint，窗口已显示时（连续第二次翻译）读到的是上一轮的旧值，
+        按上限截断就会失效，窗口被撑到内容全高、直接顶出屏幕。
+
+        宽度分窄/宽两档：收窄后高度不变（内容本来不折行）就用窄窗口，
+        查单词这类短内容不再留一大片空白。"""
+        g = self._screen().availableGeometry()   # 按窗口所在屏幕定上限（多屏尺寸不同）
+        inner_wide, inner_narrow = 480, 400  # 内容宽；窗口宽 = 内容宽 + 42（边距与滚动条）
+        h_wide = self._measure_content(inner_wide)
+        inner_w, ch = inner_wide, h_wide
+        if self._measure_content(inner_narrow) <= h_wide:
+            inner_w, ch = inner_narrow, h_wide   # 窄宽不增高 → 内容短，用窄的
+        chrome = self._chrome()
+        max_h = int(g.height() * 0.7)
+        scroll_h = ch if ch + chrome <= max_h else max(60, max_h - chrome)
+        self._auto_sizing = True   # 标记：这一轮尺寸变化是自动的，不是用户手动拖出来的
+        try:
+            self.content.setFixedWidth(inner_w)
+            self.scroll.setFixedHeight(scroll_h)
+            self.layout().invalidate()
+            self.layout().activate()
+            # 显式给最小尺寸：既限制用户能把窗口拖到多小，也让布局不再往窗口上写
+            # 它自己的最小尺寸（SetDefaultConstraint 只在窗口没有最小尺寸时才覆盖）
+            self.setMinimumSize(self.MIN_W, self.MIN_H)
+            self.resize(inner_w + 42, max(self.MIN_H, min(ch + chrome, max_h)))
+            # 兜底：布局的最小尺寸仍可能把窗口撑高（字体/DPI 差异），按实际高度再压一次
+            over = self.height() - max_h
+            if over > 0:
+                self.scroll.setFixedHeight(max(60, self.scroll.height() - over))
+                self.layout().invalidate()
+                self.layout().activate()
+                self.resize(inner_w + 42, max_h)
+        finally:
+            self._auto_sizing = False
+        self._keep_on_screen()
+
+    def _keep_on_screen(self):
+        """把窗口平移回屏幕可用区域内（只挪位置，不改大小）。
+
+        典型场景：按下快捷键时弹窗很小、落在光标下方，翻译完成时长译文填入、
+        窗口突然变高，底部就被顶出屏幕之外——这里整体上移，贴住屏幕底边。
+        窗口比屏幕还大时贴左上角，保证标题栏和底部方向按钮可见。"""
+        scr = (QGuiApplication.screenAt(self.frameGeometry().center())
+               or QGuiApplication.primaryScreen())
+        g = scr.availableGeometry()
+        max_x = max(g.left(), g.right() + 1 - self.width())
+        max_y = max(g.top(), g.bottom() + 1 - self.height())
+        x = min(max(self.x(), g.left()), max_x)
+        y = min(max(self.y(), g.top()), max_y)
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
+        self._last_screen = scr   # 记录当前屏幕，避免紧接着的 moveEvent 重复触发一轮自适应
+
+    # ---- 无边框窗口：边缘拖拽调整大小 + 空白处拖动移动 ----
+    def _resize_edges(self, pos):
+        """鼠标位置命中的窗口边缘（None 表示不在边缘），用于拖拽调整大小"""
+        m = self.RESIZE_MARGIN
+        near_l, near_r = pos.x() <= m, pos.x() >= self.width() - m
+        near_t, near_b = pos.y() <= m, pos.y() >= self.height() - m
+        edges = None
+        if near_l:
+            edges = Qt.LeftEdge
+        elif near_r:
+            edges = Qt.RightEdge
+        if near_t:
+            edges = Qt.TopEdge if edges is None else (edges | Qt.TopEdge)
+        elif near_b:
+            edges = Qt.BottomEdge if edges is None else (edges | Qt.BottomEdge)
+        return edges
+
+    def _update_resize_cursor(self, pos):
+        """移到边缘时显示双向箭头，提示这里可以拖动调整窗口大小"""
+        edges = self._resize_edges(pos) if self.rect().contains(pos) else None
+        if edges is None:
+            self.unsetCursor()
+            return
+        left, right = bool(edges & Qt.LeftEdge), bool(edges & Qt.RightEdge)
+        top, bottom = bool(edges & Qt.TopEdge), bool(edges & Qt.BottomEdge)
+        if (left and top) or (right and bottom):
+            self.setCursor(Qt.SizeFDiagCursor)
+        elif (right and top) or (left and bottom):
+            self.setCursor(Qt.SizeBDiagCursor)
+        elif left or right:
+            self.setCursor(Qt.SizeHorCursor)
+        else:
+            self.setCursor(Qt.SizeVerCursor)
+
+    def _install_hover_tracking(self):
+        """给所有子控件装鼠标移动过滤器。
+
+        滚动区（QScrollArea）等子控件会接收并吃掉鼠标移动事件，不让它冒泡到窗口，
+        导致窗口的 mouseMoveEvent 收不到——光标会一直停在“双向箭头”上不变回来
+        （鼠标移到译文/按钮上也不恢复，只有移出整个窗口才恢复）。"""
+        for w in self.findChildren(QWidget):
+            w.setMouseTracking(True)
+            w.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.MouseMove:
+            self._update_resize_cursor(
+                self.mapFromGlobal(ev.globalPosition().toPoint()))
+        return super().eventFilter(obj, ev)
+
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            handle = self.windowHandle()
+            edges = self._resize_edges(e.position().toPoint()) if handle is not None else None
+            if edges is not None and handle.startSystemResize(edges):
+                # 边缘按下：交给系统接管调整大小，手感和普通窗口拖边一样
+                e.accept()
+                return
+            # 不在边缘（或系统不支持拖拽调整大小）时：退回拖动移动窗口
             self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
             e.accept()
 
@@ -307,14 +462,47 @@ class ResultPopup(QWidget):
         if pos is not None and e.buttons() & Qt.LeftButton:
             self.move(e.globalPosition().toPoint() - pos)
             e.accept()
+            return
+        self._update_resize_cursor(e.position().toPoint())
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
+        self._update_resize_cursor(e.position().toPoint())
 
-    def show_loading(self, text, way="划词"):
-        """按快捷键后立即弹出：显示原文 + 加载动画，翻译完成原地更新"""
+    def moveEvent(self, e):
+        """窗口被拖到另一块显示器时按新屏幕重新自适应。
+
+        两台显示器尺寸/缩放往往不同，继续沿用旧屏幕算出的高度可能直接超出新屏幕。"""
+        super().moveEvent(e)
+        scr = QGuiApplication.screenAt(self.frameGeometry().center())
+        if scr is None or scr is self._last_screen:
+            return
+        self._last_screen = scr
+        if self.isVisible() and not self._auto_sizing:
+            self._fit_size()
+
+    def resizeEvent(self, e):
+        """用户拖边缘改变窗口大小：内容宽度跟着窗口走（文字重新折行），滚动区填满剩余高度。
+
+        滚动区必须占满“窗口高 - 非滚动部分”：否则多余空间无处消化，
+        布局会把标题行往下推、把内容撑散（标题行悬在中间、下方一大片空白）。
+        这样多余空白只会留在滚动区内部，标题行贴顶、底部按钮跟在内容后面。
+        _fit_size 自动调整时跳过——它已按内容算好尺寸，别覆盖。"""
+        super().resizeEvent(e)
+        if self._auto_sizing:
+            return
+        avail = max(200, self.width() - 42)
+        if abs(self.content.width() - avail) > 1:
+            self.content.setFixedWidth(avail)
+        self.scroll.setFixedHeight(max(60, self.height() - self._chrome()))
+        self._keep_on_screen()
+
+    def show_loading(self, text, way="划词", direction="auto"):
+        """按快捷键后立即弹出：显示原文 + 加载动画，翻译完成原地更新。
+        direction 是本次请求的方向，用于同步底部按钮选中态（不触发重译）"""
         self._loading = True
-        self._data = {"text": text}
+        self._data = {"text": text, "way": way}
+        self._set_dir(direction)
         self._pinned = False
         self.btn_pin.setText("📌")
         self.btn_pin.setStyleSheet("")
@@ -328,7 +516,6 @@ class ResultPopup(QWidget):
             self.lab_orig.setText("原文：（未识别到原文）")
             self.lab_orig.setToolTip("")
             self.lab_orig.show()
-        self.lab_phon.hide()
         self.lab_trans.setStyleSheet("color:#9aa3b2;font-size:14px;font-weight:normal;")
         self._load_dots = 0
         self._load_msg = ("正在识别并翻译截图，请稍候" if way == "截图"
@@ -368,7 +555,6 @@ class ResultPopup(QWidget):
         self.lab_trans.setStyleSheet("color:#dc2626;font-size:14px;font-weight:normal;")
         self.lab_trans.setText(_soft_wrap(msg))
         self.lab_meta.setText("")
-        self.lab_phon.hide()
         for b in (self.btn_copy, self.btn_speak):
             b.setEnabled(False)
         self._fit_size()
@@ -405,41 +591,23 @@ class ResultPopup(QWidget):
         self._pinned = False
         self.btn_pin.setText("📌")
         self.btn_pin.setStyleSheet("")
-        is_word = data.get("is_word")
         text = data.get("text", "")
         trans = data.get("translated", "")
         self.lab_trans.setStyleSheet("")
         for b in (self.btn_copy, self.btn_speak):
             b.setEnabled(True)
-        if data.get("reverse"):
-            self.lab_title.setText("中译英")
-        elif is_word:
-            meanings = data.get("meanings") or []
-            phon = data.get("phonetic")
-            self.lab_title.setText("词典")
-            if phon:
-                self.lab_phon.setText("/%s/" % phon)
-                self.lab_phon.show()
-            else:
-                self.lab_phon.hide()
-            if meanings:
-                self.lab_trans.setText(_soft_wrap(
-                    "\n".join("%d. %s" % (i + 1, m) for i, m in enumerate(meanings))))
-            else:
-                self.lab_trans.setText(_soft_wrap(trans or "（未查到释义）"))
-            self.lab_orig.hide()
-        else:
-            self.lab_title.setText("翻译结果")
-            self.lab_phon.hide()
-            self.lab_trans.setText(_soft_wrap(trans or "（未获取到翻译）"))
-            self.lab_orig.setText(_format_orig(text))
-            self.lab_orig.setToolTip(text)
-            self.lab_orig.show()
+        # 标题只体现方向，译文无论中译英还是英译中都必须写入，
+        # 否则译文区会一直停在“正在翻译，请稍候···”
+        self.lab_title.setText("中译英" if data.get("reverse") else "英译中")
+        self.lab_trans.setText(_soft_wrap(trans or "（未获取到翻译）"))
+        self.lab_orig.setText(_format_orig(text))
+        self.lab_orig.setToolTip(text)
+        self.lab_orig.show()
 
         self.lab_meta.setText("来源：%s" % data.get("engine", ""))
 
     def show_result(self, data, auto_close_sec=None):
-        """data: text, translated, engine, is_word, phonetic, meanings"""
+        """data: text, translated, engine, detected, reverse, way, seq"""
         was_loading = self._loading
         self._fill_result(data)
         self._loading = False
@@ -469,6 +637,7 @@ class ResultPopup(QWidget):
             if y < g.top():
                 y = g.top() + 8
         self.move(x, y)
+        self._last_screen = screen
 
     def auto_close(self):
         if self._pinned or not self.isVisible():
@@ -492,6 +661,24 @@ class ResultPopup(QWidget):
 
     def copy_trans(self):
         QApplication.clipboard().setText(_strip_soft_wrap(self.lab_trans.text()))
+
+    # ---- 翻译方向（自动判定失误时用户手动纠正）----
+    def _set_dir(self, direction):
+        """同步底部按钮选中态。
+        用 idClicked 而非 toggled 连接重译，程序内 setChecked 不会触发信号，不会造成重译循环"""
+        btn = self._dir_buttons.get(direction)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+
+    def _on_dir_clicked(self, idx):
+        """用户点“自动/中译英/英译中”：用同一段原文按指定方向重新翻译"""
+        if not 0 <= idx < len(self._dir_keys):
+            return
+        text = (self._data.get("text") or "").strip()
+        if not text:   # 截图没识别到文字等：没有原文可重译
+            return
+        self.request_retranslate.emit(text, self._data.get("way", "划词"),
+                                      self._dir_keys[idx])
 
     def do_speak(self):
         text = self._data.get("text", "")
@@ -536,6 +723,12 @@ class MainWindow(QWidget):
             "翻译历史里选中一行点【朗读选中】也可以复习发音。</p>"
             "<p><b>④ 小技巧：</b>划中文会自动<b>翻译成英文</b>——想写英文句子时，"
             "先在任意地方打好中文，选中按 Alt+Q 就得到英文表达。</p>"
+            "<p><b>⑤ 方向判错了？</b>翻译弹窗底部有 <b>自动 / 中译英 / 英译中</b> 三个按钮，"
+            "默认「自动」（程序自己判断中英文）。万一判错（比如中英混排的句子），"
+            "点一下「中译英」或「英译中」，它会立刻按你选的方向<b>重新翻译</b>。</p>"
+            "<p><b>⑥ 窗口太挤或太空？</b>鼠标移到弹窗<b>边缘</b>会出现双向箭头，"
+            "按住拖动就能自己调整窗口大小；同时用两个显示器也没问题——"
+            "窗口拖到哪块屏幕，就按哪块屏幕自动适配尺寸，不会跑到屏幕外面去。</p>"
             "<h3>遇到问题？</h3>"
             "<p>· 提示<b>“没有取到文字”</b>：重新选中文字再按一次 Alt+Q；"
             "如果那个软件是用<b>管理员身份</b>运行的，请在英译通图标上点右键→“以管理员身份运行”；"

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""核心功能实测：Qwen 翻译 / 有道词典 / Qwen 视觉截图翻译"""
+"""核心功能实测：Qwen 翻译 / Qwen 视觉截图翻译"""
 import sys
 import os
 
@@ -29,15 +29,7 @@ except Exception as e:
 
 print()
 print("=" * 50)
-print("3) 有道词典查词测试")
-print("=" * 50)
-for w in ["hello", "apple", "transaction"]:
-    ph, ms = core.lookup_word(w)
-    print("[%s] 音标=%s 释义=%s" % (w, ph, ms[:3]))
-
-print()
-print("=" * 50)
-print("4) Qwen 视觉截图翻译测试（生成英文图片直接发模型，无本地OCR）")
+print("3) Qwen 视觉截图翻译测试（生成英文图片直接发模型，无本地OCR）")
 print("=" * 50)
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -61,7 +53,4 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
-print()
-print("is_single_word 测试:", core.is_single_word("hello"), core.is_single_word("hello world foo bar"),
-      core.is_single_word("The quick brown fox jumps over the lazy dog."))
 print("全部测试完成")

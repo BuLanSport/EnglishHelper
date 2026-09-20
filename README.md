@@ -48,13 +48,13 @@ build.bat
 
 ```
 main.py            主程序：托盘、全局热键、单实例唤醒、划词/截图流程
-core.py            核心：Qwen 文本/视觉翻译、词典、数据库、朗读、开机自启
+core.py            核心：Qwen 文本/视觉翻译、数据库、朗读、开机自启
 ui.py              界面：翻译浮窗、截图遮罩、主窗口
 gen_icon.py        图标生成
 requirements.txt   依赖清单（pip install -r requirements.txt）
 installer.iss      安装包制作脚本（Inno Setup；版本号在文件顶部）
 build_installer.bat 一键生成安装包（输出 dist\installer\*.exe）
-test_core.py       Qwen 翻译/词典/视觉截图翻译实测脚本
+test_core.py       Qwen 翻译/视觉截图翻译实测脚本
 test_hotkey_e2e.py 划词端到端自动化测试（真实记事本）
 test_popup_ui.py   浮窗 UI 自动化测试（拖动/滚动/图钉/悬停）
 ```

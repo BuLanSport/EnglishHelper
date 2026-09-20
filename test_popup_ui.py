@@ -24,8 +24,7 @@ def main():
     p.show_loading(long_text, "划词")
     p.show_result({"text": long_text,
                    "translated": "今天天气非常好，我们应该和所有朋友去公园踢足球。" * 40,
-                   "engine": "test", "is_word": False, "phonetic": None,
-                   "meanings": [], "detected": "en", "way": "划词"})
+                   "engine": "test", "detected": "en", "way": "划词"})
     g = app.primaryScreen().availableGeometry()
     max_h = int(g.height() * 0.7)
     assert p.height() <= max_h + 2, "窗口高度超限: %d > %d" % (p.height(), max_h)
@@ -40,9 +39,33 @@ def main():
 
     # ---- 2) 短文本：不出现多余滚动条 ----
     p.show_result({"text": "apple", "translated": "苹果", "engine": "t",
-                   "is_word": False, "phonetic": None, "meanings": [],
                    "detected": "en", "way": "划词"})
     print("短文本 高度=%d 滚动max=%d" % (p.height(), p.scroll.verticalScrollBar().maximum()))
+
+    # ---- 2.5) 翻译方向手动指定 ----
+    got = {}
+    p.request_retranslate.connect(lambda t, w, d: got.update(text=t, way=w, dir=d))
+    p.show_loading("今天天气很好", "划词")
+    assert p._dir_buttons["auto"].isChecked(), "新划词默认应选中自动"
+    p._dir_buttons["en"].click()          # 用户点“中译英”
+    assert got == {"text": "今天天气很好", "way": "划词", "dir": "en"}, got
+    assert p._dir_buttons["en"].isChecked(), "点击后应选中中译英"
+    # 重译时按钮选中态跟随请求方向；结果回填不改变用户的选择
+    p.show_loading("今天天气很好", "划词", direction="en")
+    assert p._dir_buttons["en"].isChecked()
+    p.show_result({"text": "今天天气很好", "translated": "The weather is nice today.",
+                   "engine": "t", "detected": "zh-CN", "way": "划词", "reverse": True})
+    assert p._dir_buttons["en"].isChecked(), "结果回填不应重置用户选择"
+    assert p.lab_title.text() == "中译英", p.lab_title.text()
+    # 下一次划词回到“自动”
+    p.show_loading("hello world", "划词")
+    assert p._dir_buttons["auto"].isChecked(), "新划词应回到自动"
+    # 无原文（截图未识别到文字）时不发起重译
+    got.clear()
+    p.show_loading("", "截图")
+    p._dir_buttons["zh"].click()
+    assert got == {}, got
+    print("翻译方向切换 OK")
 
     # ---- 3) 图钉 ----
     p.toggle_pin()
